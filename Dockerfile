@@ -1,6 +1,10 @@
 # ── Single-stage Bun — runs TypeScript natively ──
 FROM oven/bun:1-alpine
 
+LABEL org.opencontainers.image.source="https://github.com/martianacademy/forkscout-memory-mcp"
+LABEL org.opencontainers.image.description="Persistent memory MCP server for AI agents - knowledge graph, vector search, structured facts"
+LABEL org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 COPY package.json bun.lock* ./
