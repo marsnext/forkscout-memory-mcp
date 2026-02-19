@@ -1,34 +1,35 @@
 # forkscout-memory-mcp
 
-Standalone MCP (Model Context Protocol) server for **Forkscout** shared memory — knowledge graph, conversation history, and active task tracking.
+Standalone MCP (Model Context Protocol) server for persistent AI agent memory — knowledge graph, conversation history, active task tracking, and self-identity.
 
-Lightweight, independent service. No agent, no LLM, no Playwright. Persists everything to a single `memory.json` file.
+Lightweight, independent service. No agent, no LLM, no Playwright. Persists everything to a single `memory.json` file. Runs on **Bun** for fast startup and native TypeScript execution.
 
 ## Features
 
-- **18 MCP tools** exposed over Streamable HTTP (stateless, one request = one response)
-- **Knowledge graph** — entities, relations, facts, and full-text search
+- **19 MCP tools** exposed over Streamable HTTP (stateless, one request = one response)
+- **Knowledge graph** — entities with structured facts (confidence scores, source tracking), relations, and full-text search
 - **Conversation memory** — exchange tracking with search
 - **Active task tracking** — start, complete, abort, heartbeat, auto-expire
 - **Self-identity** — agent self-entity with observation recording
-- **Single-file persistence** — `memory.json` (MemoryData v4 format)
+- **Memory intelligence** — contradiction detection, usage tracking, confidence decay, automated consolidation
+- **Two-tier consolidation** — light (confidence refresh on every flush, 5min throttle) + full (pruning, duplicate detection, orphan cleanup, file verification, 24h timer)
+- **Single-file persistence** — `memory.json` (MemoryData v5 format with structured facts)
 - **Periodic auto-flush** — writes every 30 seconds + on shutdown
-- **Docker-ready** — multi-stage build, ~161MB image (node:22-alpine)
+- **Docker-ready** — single-stage Bun build, ~121MB image (oven/bun:1-alpine)
 
 ## Quick Start
 
 ### Local Development
 
 ```bash
-pnpm install
-pnpm dev          # tsx watch mode, auto-reload on changes
+bun install
+bun --watch src/server.ts    # watch mode, auto-reload on changes
 ```
 
 ### Production
 
 ```bash
-pnpm build        # esbuild → dist/server.mjs (single bundled file)
-pnpm start        # node dist/server.js
+bun run src/server.ts        # Bun runs TypeScript natively — no build step needed
 ```
 
 ### Docker
@@ -36,42 +37,54 @@ pnpm start        # node dist/server.js
 ```bash
 docker build -t forkscout-memory-mcp .
 docker run -d -p 3211:3211 -v memory-data:/data forkscout-memory-mcp
+
+# or with docker compose
+docker compose up -d
+```
+
+### Docker Hub
+
+```bash
+docker pull martianacademy/forkscout-memory-mcp:latest
+docker run -d -p 3211:3211 -v memory-data:/data martianacademy/forkscout-memory-mcp
 ```
 
 ## Environment Variables
 
-| Variable         | Default                                 | Description                        |
-| ---------------- | --------------------------------------- | ---------------------------------- |
-| `MEMORY_PORT`    | `3211`                                  | HTTP server port                   |
-| `MEMORY_HOST`    | `0.0.0.0`                               | Bind address                       |
-| `MEMORY_STORAGE` | `.forkscout` (local) / `/data` (Docker) | Directory for `memory.json`        |
-| `MEMORY_OWNER`   | `Admin`                                 | Owner name used in the self-entity |
+| Variable                   | Default                                 | Description                                               |
+| -------------------------- | --------------------------------------- | --------------------------------------------------------- |
+| `MEMORY_PORT`              | `3211`                                  | HTTP server port                                          |
+| `MEMORY_HOST`              | `0.0.0.0`                               | Bind address                                              |
+| `MEMORY_STORAGE`           | `.forkscout` (local) / `/data` (Docker) | Directory for `memory.json`                               |
+| `MEMORY_OWNER`             | `Admin`                                 | Owner name used in the self-entity                        |
+| `CONSOLIDATION_INTERVAL_MS`| `86400000` (24h)                        | Full consolidation interval (pruning, dedup, verification)|
+| `VERIFY_FILES`             | `true`                                  | Verify file entities against filesystem (disable in Docker)|
 
 ## Endpoints
 
 | Method | Path      | Description                                                 |
 | ------ | --------- | ----------------------------------------------------------- |
-| `GET`  | `/health` | Health check — returns entity/relation/exchange/task counts |
+| `GET`  | `/health` | Health check — returns entity/relation/exchange/task counts + consolidation config |
 | `GET`  | `/`       | Same as `/health`                                           |
 | `POST` | `/mcp`    | MCP JSON-RPC endpoint (Streamable HTTP with SSE responses)  |
 
-## MCP Tools (18)
+## MCP Tools (19)
 
 ### Knowledge
 
 | Tool               | Description                                       |
 | ------------------ | ------------------------------------------------- |
-| `save_knowledge`   | Save a fact to long-term memory                   |
-| `search_knowledge` | Search long-term memory by natural language query |
+| `save_knowledge`   | Save a fact to long-term memory (with contradiction warnings) |
+| `search_knowledge` | Search long-term memory by natural language query  |
 
 ### Entities
 
-| Tool               | Description                                    |
-| ------------------ | ---------------------------------------------- |
-| `add_entity`       | Add or update an entity in the knowledge graph |
-| `search_entities`  | Search entities by name or facts               |
-| `get_entity`       | Look up a specific entity by name              |
-| `get_all_entities` | Get all entities (optional limit)              |
+| Tool               | Description                                                        |
+| ------------------ | ------------------------------------------------------------------ |
+| `add_entity`       | Add or update an entity (returns contradiction warnings if detected) |
+| `search_entities`  | Search entities by name or facts (bumps usage tracking)            |
+| `get_entity`       | Look up a specific entity by name                                  |
+| `get_all_entities` | Get all entities (optional limit)                                  |
 
 ### Relations
 
@@ -103,12 +116,13 @@ docker run -d -p 3211:3211 -v memory-data:/data forkscout-memory-mcp
 | `get_self_entity` | Get the agent's self-identity entity |
 | `self_observe`    | Record a self-observation            |
 
-### System
+### Maintenance
 
-| Tool           | Description                                      |
-| -------------- | ------------------------------------------------ |
-| `memory_stats` | Show memory statistics and entity type breakdown |
-| `clear_all`    | Clear all memory (destructive, requires reason)  |
+| Tool                  | Description                                                    |
+| --------------------- | -------------------------------------------------------------- |
+| `consolidate_memory`  | Run full consolidation (prune stale facts, detect duplicates)  |
+| `get_stale_entities`  | Find entities not accessed for N days                          |
+| `memory_stats`        | Show memory statistics and entity type breakdown               |
 
 ## Connecting from VS Code
 
@@ -127,6 +141,33 @@ Add to your VS Code settings or `.vscode/mcp.json`:
 }
 ```
 
+## Memory Intelligence
+
+### Contradiction Detection
+
+When adding facts to an entity, the server automatically detects contradictions:
+- **Negation patterns** — "uses TypeScript" vs "does not use TypeScript"
+- **Number/version conflicts** — "port is 3210" vs "port is 8080", "version 3.0" vs "version 5.0"
+
+Contradictions are returned as warnings — both facts are kept, but the caller is alerted.
+
+### Confidence System
+
+Every fact has a confidence score based on:
+- **Source base** (0.30–0.60) — how many independent sources confirmed the fact (permanent floor)
+- **Recency bonus** (0–0.30) — additive bonus that decays over 90 days
+
+Facts never decay below their source floor, even after years of inactivity. Protected entity types (`agent-self`, `person`, `project`, `preference`, `decision`, `organization`, `skill`, `constraint`) are never pruned.
+
+### Usage Tracking
+
+Every `search_entities` call bumps `accessCount` and `lastSeen` on retrieved entities, enabling stale entity detection.
+
+### Two-Tier Consolidation
+
+- **Light** — confidence refresh runs inside `flush()` on every dirty write (throttled to once per 5 minutes)
+- **Full** — pruning, duplicate detection (Jaccard similarity), orphan relation cleanup, and file verification runs on a periodic timer (default 24h)
+
 ## Protocol
 
 The server implements MCP over **Streamable HTTP** (stateless mode):
@@ -138,16 +179,24 @@ The server implements MCP over **Streamable HTTP** (stateless mode):
 
 ## Data Format
 
-`memory.json` uses **MemoryData v4**:
+`memory.json` uses **MemoryData v5** (structured facts with confidence):
 
 ```json
 {
-    "version": 4,
+    "version": 5,
     "entities": [
-        { "name": "...", "type": "person|project|technology|...", "facts": [], "lastSeen": 0, "accessCount": 0 }
+        {
+            "name": "...",
+            "type": "person|project|technology|...",
+            "facts": [
+                { "content": "...", "sources": 1, "firstSeen": 0, "lastConfirmed": 0 }
+            ],
+            "lastSeen": 0,
+            "accessCount": 0
+        }
     ],
-    "relations": [{ "from": "...", "to": "...", "type": "uses|owns|works-on|...", "createdAt": 0 }],
-    "exchanges": [{ "id": "ex_...", "user": "...", "assistant": "...", "timestamp": 0, "sessionId": "..." }],
+    "relations": [{ "from": "...", "to": "...", "type": "uses|owns|works-on|...", "weight": 1, "createdAt": 0 }],
+    "exchanges": [{ "id": "ex_...", "user": "...", "assistant": "...", "timestamp": 0, "importance": 0.5, "sessionId": "..." }],
     "activeTasks": [
         {
             "id": "task_...",
@@ -163,7 +212,7 @@ The server implements MCP over **Streamable HTTP** (stateless mode):
 
 ### Entity Types
 
-`person` · `project` · `technology` · `preference` · `concept` · `file` · `service` · `organization` · `agent-self` · `other`
+`person` · `project` · `technology` · `preference` · `concept` · `file` · `service` · `organization` · `agent-self` · `decision` · `skill` · `constraint` · `other`
 
 ### Relation Types
 
@@ -174,12 +223,13 @@ The server implements MCP over **Streamable HTTP** (stateless mode):
 ```
 forkscout-memory-mcp/
 ├── src/
-│   ├── server.ts    # HTTP server, MCP transport, graceful shutdown
-│   ├── store.ts     # MemoryStore — entities, relations, exchanges, search
+│   ├── server.ts    # HTTP server, MCP transport, consolidation timer, graceful shutdown
+│   ├── store.ts     # MemoryStore — entities, relations, exchanges, search, consolidation, contradiction detection
 │   ├── tasks.ts     # TaskManager — active task tracking & auto-expiry
-│   ├── tools.ts     # 18 MCP tool registrations
-│   └── types.ts     # Type definitions (MemoryData v4, Entity, Relation, etc.)
-├── Dockerfile       # Multi-stage: esbuild bundle → node:22-alpine
+│   ├── tools.ts     # 19 MCP tool registrations
+│   └── types.ts     # Type definitions (MemoryData v5, Entity, Fact, Relation, etc.)
+├── Dockerfile       # Single-stage: oven/bun:1-alpine — runs TypeScript natively
+├── docker-compose.yml
 ├── package.json
 ├── tsconfig.json
 └── .dockerignore
@@ -187,4 +237,4 @@ forkscout-memory-mcp/
 
 ## License
 
-Private — part of the Forkscout project.
+MIT

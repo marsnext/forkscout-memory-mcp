@@ -1,13 +1,12 @@
 {
   "name": "forkscout-memory-mcp",
-  "version": "1.0.0",
-  "description": "Standalone MCP server for Forkscout shared memory (knowledge graph + tasks)",
-  "private": true,
+  "version": "1.1.0",
+  "description": "Standalone MCP server for persistent AI agent memory — knowledge graph, conversation history, task tracking, and self-identity. Runs on Bun.",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "src/server.ts",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "dev": "bun --watch src/server.ts",
+    "start": "bun run src/server.ts",
     "build": "esbuild src/server.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/server.mjs",
     "clean": "rm -rf dist"
   },

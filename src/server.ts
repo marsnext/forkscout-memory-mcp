@@ -29,6 +29,11 @@ const HOST = process.env.MEMORY_HOST || '0.0.0.0';
 const STORAGE_DIR = process.env.MEMORY_STORAGE || resolve(process.cwd(), '.forkscout');
 const OWNER = process.env.MEMORY_OWNER || 'Admin';
 
+/** Full consolidation interval: default 24 hours (light consolidation runs on every flush). */
+const CONSOLIDATION_INTERVAL_MS = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || String(24 * 60 * 60 * 1000), 10);
+/** Whether to verify file entities against the filesystem. Disable in Docker. */
+const VERIFY_FILES = process.env.VERIFY_FILES !== 'false';
+
 function createMcpServer(store: MemoryStore) {
     const mcp = new McpServer({ name: 'forkscout-memory', version: '1.0.0' });
     registerTools(mcp, store);
@@ -42,6 +47,53 @@ async function main() {
 
     // ── Periodic flush ───────────────────────────────
     const flushInterval = setInterval(() => store.flush(), 30_000);
+
+    // ── Periodic consolidation ───────────────────────
+    let consolidationRunning = false;
+    const runConsolidation = async () => {
+        if (consolidationRunning) return;
+        consolidationRunning = true;
+        try {
+            console.log('[Consolidator] Starting full consolidation (pruning + verification)...');
+
+            // 1. Consolidate (confidence refresh, pruning, orphan cleanup, duplicate detection)
+            const report = store.consolidate();
+            const lines = [
+                `  Confidence refreshed: ${report.factsRefreshed}`,
+                `  Facts pruned: ${report.factsPruned}`,
+                `  Empty entities removed: ${report.entitiesRemoved}`,
+                `  Orphan relations removed: ${report.relationsRemoved}`,
+            ];
+            if (report.duplicatesFound.length > 0) {
+                lines.push(`  Potential duplicates: ${report.duplicatesFound.length}`);
+            }
+
+            // 2. Verify file entities (if running with fs access)
+            if (VERIFY_FILES) {
+                const vResult = await store.verifyFileEntities();
+                lines.push(`  Files verified: ${vResult.filesChecked}, missing: ${vResult.filesMissing}`);
+            }
+
+            // 3. Count stale entities (for logging)
+            const stale = store.getStaleEntities({ maxAgeDays: 30 });
+            lines.push(`  Stale entities (>30d): ${stale.length}`);
+
+            await store.flush();
+            console.log(`[Consolidator] Done:\n${lines.join('\n')}`);
+        } catch (err) {
+            console.error('[Consolidator] Error:', err instanceof Error ? err.message : String(err));
+        } finally {
+            consolidationRunning = false;
+        }
+    };
+
+    // First run after 60s (let the server settle), then every CONSOLIDATION_INTERVAL_MS
+    const consolidationDelay = setTimeout(() => {
+        runConsolidation();
+    }, 60_000);
+    const consolidationInterval = setInterval(runConsolidation, CONSOLIDATION_INTERVAL_MS);
+    const intervalHours = Math.round(CONSOLIDATION_INTERVAL_MS / 3600000);
+    console.log(`🔧 Consolidation: confidence refresh on every flush (5min throttle), full pruning every ${intervalHours}h, file verification: ${VERIFY_FILES ? 'on' : 'off'}`);
 
     // ── HTTP server ──────────────────────────────────
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -63,6 +115,11 @@ async function main() {
                 relations: store.relationCount,
                 exchanges: store.exchangeCount,
                 activeTasks: store.tasks.runningCount,
+                consolidation: {
+                    fullIntervalHours: Math.round(CONSOLIDATION_INTERVAL_MS / 3600000),
+                    confidenceRefresh: 'on-flush (5min throttle)',
+                    verifyFiles: VERIFY_FILES,
+                },
             }));
             return;
         }
@@ -109,6 +166,8 @@ async function main() {
     const shutdown = async () => {
         console.log('\n🧠 Flushing memory...');
         clearInterval(flushInterval);
+        clearTimeout(consolidationDelay);
+        clearInterval(consolidationInterval);
         await store.flush();
         server.close();
         process.exit(0);

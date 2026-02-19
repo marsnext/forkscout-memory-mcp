@@ -1,0 +1,23 @@
+services:
+  memory:
+    image: forkscout-memory-mcp
+    container_name: forkscout-memory-mcp
+    ports:
+      - "3211:3211"
+    volumes:
+      - memory-data:/data
+    environment:
+      - PORT=3211
+      - DATA_DIR=/data
+      - OWNER_NAME=Suru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3211/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  memory-data:
+    external: true

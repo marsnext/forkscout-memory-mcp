@@ -1,12 +1,201 @@
 /**
  * Memory Store — single JSON persistence for entities, relations, exchanges, and tasks.
+ * Supports v4→v5 migration (structured facts, weighted relations, exchange importance).
  */
 
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
-import type { Entity, EntityType, Exchange, MemoryData, Relation, RelationType, SearchResult } from './types.js';
+import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4 } from './types.js';
 import { SELF_ENTITY_NAME } from './types.js';
 import { TaskManager } from './tasks.js';
+
+// ── Types ────────────────────────────────────────────
+
+export interface ConsolidationReport {
+    factsRefreshed: number;
+    factsPruned: number;
+    entitiesRemoved: number;
+    relationsRemoved: number;
+    duplicatesFound: Array<{ entityA: string; entityB: string; similarity: number }>;
+}
+
+export interface ContradictionWarning {
+    entity: string;
+    existingFact: string;
+    newFact: string;
+    reason: string;
+}
+
+// ── Confidence helpers ───────────────────────────────
+
+/**
+ * Auto-calculate confidence from sources count and recency.
+ *
+ * Design: long-term knowledge should NOT decay to zero just because nobody
+ * interacted for a while. A fact stated once is still valuable after 6 months.
+ *
+ * Guarantees:
+ *   - 1 source → floor at 0.3 (never drops below, even after years)
+ *   - 2 sources → floor at 0.42
+ *   - 3+ sources → floor at 0.50+
+ *   - Recency adds a bonus (up to +0.30) that decays over 90 days
+ *   - Net effect: recently confirmed facts score higher, but old facts
+ *     are never garbage-collected just by time passing.
+ */
+function computeConfidence(sources: number, lastConfirmedMs: number): number {
+    // Base: more sources → higher confidence (diminishing returns)
+    // Floor: 1 source = 0.30, 2 = 0.42, 3 = 0.50, 5+ = 0.60
+    const sourceScore = Math.min(sources / 5, 1); // 0..1
+    const sourceBase = 0.30 + sourceScore * 0.30;  // 0.30..0.60
+
+    // Recency bonus: decays over 90 days (half-life ~62 days)
+    // This is additive — it boosts recent facts but never hurts old ones
+    const ageMs = Date.now() - lastConfirmedMs;
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    const recencyBonus = Math.exp(-ageDays / 90) * 0.30; // 0..0.30
+
+    return Math.round(Math.min(sourceBase + recencyBonus, 1) * 100) / 100;
+}
+
+/** Create a new Fact from a plain string. */
+function createFact(content: string): Fact {
+    const now = Date.now();
+    return { content, confidence: 1.0, sources: 1, firstSeen: now, lastConfirmed: now };
+}
+
+/** Migrate a v4 string fact to a v5 structured Fact. */
+function migrateFact(content: string, entityLastSeen: number): Fact {
+    return {
+        content,
+        confidence: 0.8, // existing facts get reasonable but not perfect confidence
+        sources: 1,
+        firstSeen: entityLastSeen, // best guess — we don't have the original timestamp
+        lastConfirmed: entityLastSeen,
+    };
+}
+
+/** Migrate a v4 relation to v5 (add weight, evidenceCount, lastValidated). */
+function migrateRelation(r: { from: string; to: string; type: RelationType; createdAt: number }): Relation {
+    return { ...r, weight: 0.5, evidenceCount: 1, lastValidated: r.createdAt };
+}
+
+/** Migrate a v4 exchange to v5 (add importance: undefined). */
+function migrateExchange(ex: { id: string; user: string; assistant: string; timestamp: number; sessionId: string }): Exchange {
+    return { ...ex }; // importance is optional, so undefined is fine
+}
+
+// ── File path extraction ─────────────────────────────
+
+/** Try to extract a file path from a file entity's name or facts. */
+function extractFilePath(entity: Entity): string | null {
+    const name = entity.name;
+    // Common patterns: entity name IS the path
+    if (name.includes('/') || name.match(/\.\w{1,5}$/)) return name;
+    // Or a fact contains a path
+    for (const fact of entity.facts) {
+        const match = fact.content.match(/(?:path|file|located at|in)\s+[`"']?([/\w.-]+\.\w+)/i);
+        if (match) return match[1];
+    }
+    return null;
+}
+
+// ── String similarity ────────────────────────────────
+
+/** Jaccard similarity on word-level bigrams of two normalised strings. */
+function jaccardSimilarity(a: string, b: string): number {
+    const bigrams = (s: string): Set<string> => {
+        const words = s.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
+        const bg = new Set<string>();
+        for (let i = 0; i < words.length - 1; i++) bg.add(`${words[i]} ${words[i + 1]}`);
+        // Also add individual words for short strings
+        for (const w of words) bg.add(w);
+        return bg;
+    };
+    const setA = bigrams(a);
+    const setB = bigrams(b);
+    if (setA.size === 0 && setB.size === 0) return 1;
+    let intersection = 0;
+    for (const x of setA) { if (setB.has(x)) intersection++; }
+    const union = setA.size + setB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+
+// ── Contradiction detection patterns ─────────────────
+
+/** Negation prefixes that signal potential contradiction. */
+const NEGATION_PATTERNS = [
+    /^no longer\b/i, /^not\b/i, /^never\b/i, /^doesn'?t\b/i, /^don'?t\b/i,
+    /^isn'?t\b/i, /^wasn'?t\b/i, /^aren'?t\b/i, /^cannot\b/i, /^can'?t\b/i,
+    /\bdoes not\b/i, /\bdo not\b/i, /\bdid not\b/i, /\bwill not\b/i, /\bshould not\b/i,
+    /\bdeprecated\b/i, /\bremoved\b/i, /\bdisabled\b/i, /\bno longer\b/i,
+];
+
+/** Detect version/number conflicts between two fact strings. */
+function detectNumberConflict(a: string, b: string): boolean {
+    // Extract version patterns like "v2", "2.0", "port 3210"
+    const numPattern = /\b(?:v|version\s*)?(\d+(?:\.\d+)*)\b/gi;
+    const extractNums = (s: string): Map<string, string> => {
+        const result = new Map<string, string>();
+        // Remove numbers, get the "context" key
+        const stripped = s.replace(numPattern, '###');
+        const matches = [...s.matchAll(numPattern)];
+        const keys = stripped.split('###');
+        for (let i = 0; i < matches.length && i < keys.length; i++) {
+            const key = keys[i].trim().toLowerCase().replace(/\s+/g, ' ');
+            if (key.length > 2) result.set(key, matches[i][1]);
+        }
+        return result;
+    };
+    const numsA = extractNums(a);
+    const numsB = extractNums(b);
+    for (const [key, valA] of numsA) {
+        const valB = numsB.get(key);
+        if (valB && valA !== valB) return true;
+    }
+    return false;
+}
+
+/**
+ * Check if a new fact potentially contradicts an existing fact.
+ * Returns a ContradictionWarning or null.
+ */
+function checkContradiction(existingFact: Fact, newFactStr: string): ContradictionWarning | null {
+    const existing = existingFact.content.toLowerCase().trim();
+    const incoming = newFactStr.toLowerCase().trim();
+
+    // Skip very short facts (too vague to contradict)
+    if (existing.length < 10 || incoming.length < 10) return null;
+
+    // Check for negation contradictions
+    for (const pattern of NEGATION_PATTERNS) {
+        if (pattern.test(incoming) && !pattern.test(existing)) {
+            // Check they're about the same topic (word overlap > 40%)
+            const existWords = new Set(existing.split(/\s+/));
+            const incomingWords = incoming.replace(pattern, '').trim().split(/\s+/);
+            const overlap = incomingWords.filter(w => existWords.has(w)).length;
+            if (overlap / Math.max(existWords.size, incomingWords.length) > 0.4) {
+                return {
+                    entity: '', // filled by caller
+                    existingFact: existingFact.content,
+                    newFact: newFactStr,
+                    reason: 'Negation pattern detected — new fact may negate existing fact',
+                };
+            }
+        }
+    }
+
+    // Check for number/version conflicts
+    if (detectNumberConflict(existing, incoming)) {
+        return {
+            entity: '',
+            existingFact: existingFact.content,
+            newFact: newFactStr,
+            reason: 'Number/version conflict — same context but different values',
+        };
+    }
+
+    return null;
+}
 
 export class MemoryStore {
     private entities = new Map<string, Entity>();
@@ -17,6 +206,10 @@ export class MemoryStore {
     private ownerName: string;
     readonly tasks = new TaskManager();
 
+    /** Timestamp of last confidence refresh (throttle at 5 min). */
+    private lastConfidenceRefresh = 0;
+    private static readonly CONFIDENCE_REFRESH_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+
     constructor(filePath: string, ownerName = 'Admin') {
         this.filePath = filePath;
         this.ownerName = ownerName;
@@ -25,11 +218,35 @@ export class MemoryStore {
     async init(): Promise<void> {
         try {
             const raw = await readFile(this.filePath, 'utf-8');
-            const data = JSON.parse(raw) as MemoryData;
-            for (const e of data.entities) this.entities.set(this.key(e.name), e);
-            this.relations = data.relations || [];
-            this.exchanges = data.exchanges || [];
-            this.tasks.load((data as any).activeTasks || []);
+            const data = JSON.parse(raw);
+
+            if (data.version === 4 || !data.version) {
+                // ── v4 → v5 migration ────────────────────
+                console.log('🔄 Migrating memory v4 → v5 (structured facts, weighted relations)...');
+                const v4 = data as LegacyMemoryDataV4;
+                for (const e of v4.entities) {
+                    const migrated: Entity = {
+                        name: e.name,
+                        type: e.type,
+                        facts: e.facts.map(f => migrateFact(f, e.lastSeen)),
+                        lastSeen: e.lastSeen,
+                        accessCount: e.accessCount,
+                    };
+                    this.entities.set(this.key(e.name), migrated);
+                }
+                this.relations = (v4.relations || []).map(migrateRelation);
+                this.exchanges = (v4.exchanges || []).map(migrateExchange);
+                this.tasks.load(v4.activeTasks || []);
+                this.dirty = true; // force flush to write v5 format
+                console.log(`✅ Migrated ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} exchanges`);
+            } else {
+                // Already v5
+                const v5 = data as MemoryData;
+                for (const e of v5.entities) this.entities.set(this.key(e.name), e);
+                this.relations = v5.relations || [];
+                this.exchanges = v5.exchanges || [];
+                this.tasks.load(v5.activeTasks || []);
+            }
         } catch { /* start fresh */ }
         this.ensureSelfEntity();
         console.log(`🧠 Memory: ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} exchanges`);
@@ -37,10 +254,18 @@ export class MemoryStore {
 
     async flush(): Promise<void> {
         if (!this.dirty && !this.tasks.isDirty()) return;
+
+        // Auto-refresh confidence scores on every flush (throttled to once per 5 min)
+        const now = Date.now();
+        if (this.dirty && now - this.lastConfidenceRefresh > MemoryStore.CONFIDENCE_REFRESH_THROTTLE_MS) {
+            this.refreshConfidence();
+            this.lastConfidenceRefresh = now;
+        }
+
         try {
             await mkdir(dirname(this.filePath), { recursive: true });
             const data: MemoryData = {
-                version: 4,
+                version: 5,
                 entities: Array.from(this.entities.values()),
                 relations: this.relations,
                 exchanges: this.exchanges.slice(-500),
@@ -62,22 +287,45 @@ export class MemoryStore {
 
     // ── Entity CRUD ──────────────────────────────────
 
-    addEntity(name: string, type: EntityType, facts: string[]): Entity {
+    addEntity(name: string, type: EntityType, facts: string[]): { entity: Entity; contradictions: ContradictionWarning[] } {
         const k = this.key(name);
         const existing = this.entities.get(k);
+        const contradictions: ContradictionWarning[] = [];
+
         if (existing) {
             for (const f of facts) {
-                if (!existing.facts.some(ef => ef.toLowerCase() === f.toLowerCase())) existing.facts.push(f);
+                const match = existing.facts.find(ef => ef.content.toLowerCase() === f.toLowerCase());
+                if (match) {
+                    // Reinforce existing fact
+                    match.sources++;
+                    match.lastConfirmed = Date.now();
+                    match.confidence = computeConfidence(match.sources, match.lastConfirmed);
+                } else {
+                    // Check for contradictions against existing facts before adding
+                    for (const ef of existing.facts) {
+                        const warning = checkContradiction(ef, f);
+                        if (warning) {
+                            warning.entity = name;
+                            contradictions.push(warning);
+                        }
+                    }
+                    // New fact — add regardless (contradictions are warnings, not blocks)
+                    existing.facts.push(createFact(f));
+                }
             }
             existing.lastSeen = Date.now();
             existing.accessCount++;
             this.dirty = true;
-            return existing;
+            return { entity: existing, contradictions };
         }
-        const entity: Entity = { name, type, facts, lastSeen: Date.now(), accessCount: 1 };
+        const entity: Entity = {
+            name, type,
+            facts: facts.map(f => createFact(f)),
+            lastSeen: Date.now(), accessCount: 1,
+        };
         this.entities.set(k, entity);
         this.dirty = true;
-        return entity;
+        return { entity, contradictions };
     }
 
     getEntity(name: string): Entity | undefined { return this.entities.get(this.key(name)); }
@@ -99,8 +347,21 @@ export class MemoryStore {
     addRelation(from: string, type: RelationType, to: string): Relation {
         const existing = this.relations.find(r =>
             this.key(r.from) === this.key(from) && this.key(r.to) === this.key(to) && r.type === type);
-        if (existing) return existing;
-        const rel: Relation = { from, to, type, createdAt: Date.now() };
+        if (existing) {
+            // Reinforce: more evidence = higher weight
+            existing.evidenceCount++;
+            existing.lastValidated = Date.now();
+            existing.weight = Math.min(existing.evidenceCount / 5, 1); // caps at 5
+            this.dirty = true;
+            return existing;
+        }
+        const rel: Relation = {
+            from, to, type,
+            weight: 0.5,
+            evidenceCount: 1,
+            lastValidated: Date.now(),
+            createdAt: Date.now(),
+        };
         this.relations.push(rel);
         this.dirty = true;
         return rel;
@@ -110,13 +371,14 @@ export class MemoryStore {
 
     // ── Exchanges ────────────────────────────────────
 
-    addExchange(user: string, assistant: string, sessionId: string): Exchange {
+    addExchange(user: string, assistant: string, sessionId: string, importance?: number): Exchange {
         const ex: Exchange = {
             id: `ex_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             user: user.slice(0, 2000),
             assistant: assistant.slice(0, 2000),
             timestamp: Date.now(),
             sessionId,
+            importance,
         };
         this.exchanges.push(ex);
         this.dirty = true;
@@ -138,12 +400,32 @@ export class MemoryStore {
             else if (nameL.includes(q)) score += 5;
             for (const t of terms) {
                 if (nameL.includes(t)) score += 2;
-                for (const f of entity.facts) { if (f.toLowerCase().includes(t)) score += 1; }
+                for (const f of entity.facts) {
+                    if (f.content.toLowerCase().includes(t)) {
+                        // Weight by confidence — high-confidence facts matter more
+                        score += f.confidence;
+                    }
+                }
             }
+            // Recency bonus: recently seen entities rank higher
+            const ageDays = (Date.now() - entity.lastSeen) / (1000 * 60 * 60 * 24);
+            const recencyBonus = Math.exp(-ageDays / 30) * 0.5; // up to +0.5
+            score += recencyBonus;
+            // Access bonus (capped)
             score += Math.min(entity.accessCount * 0.1, 1);
             if (score > 0) scored.push({ entity, score });
         }
-        return scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.entity);
+        const results = scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.entity);
+
+        // Usage tracking: bump accessCount + lastSeen on retrieved entities
+        const now = Date.now();
+        for (const entity of results) {
+            entity.accessCount++;
+            entity.lastSeen = now;
+        }
+        if (results.length > 0) this.dirty = true;
+
+        return results;
     }
 
     searchExchanges(query: string, limit = 5): Exchange[] {
@@ -153,6 +435,11 @@ export class MemoryStore {
             let score = 0;
             const text = `${ex.user} ${ex.assistant}`.toLowerCase();
             for (const t of terms) { if (text.includes(t)) score += 1; }
+            // Importance bonus
+            if (ex.importance) score += ex.importance * 2;
+            // Recency bonus for exchanges
+            const ageDays = (Date.now() - ex.timestamp) / (1000 * 60 * 60 * 24);
+            score += Math.exp(-ageDays / 14) * 0.5; // half-life ~10 days
             if (score > 0) scored.push({ ex, score });
         }
         return scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.ex);
@@ -161,12 +448,29 @@ export class MemoryStore {
     searchKnowledge(query: string, limit = 5): SearchResult[] {
         const results: SearchResult[] = [];
         for (const e of this.searchEntities(query, limit)) {
-            results.push({ content: `${e.name} (${e.type}): ${e.facts.slice(0, 5).join('; ')}`, source: 'graph', relevance: 90 });
+            // Show top facts by confidence
+            const topFacts = [...e.facts]
+                .sort((a, b) => b.confidence - a.confidence)
+                .slice(0, 5)
+                .map(f => f.content);
+            const avgConf = e.facts.length > 0
+                ? Math.round(e.facts.reduce((s, f) => s + f.confidence, 0) / e.facts.length * 100)
+                : 0;
+            results.push({
+                content: `${e.name} (${e.type}, ${avgConf}% conf): ${topFacts.join('; ')}`,
+                source: 'graph',
+                relevance: avgConf,
+            });
         }
         for (const ex of this.searchExchanges(query, limit)) {
-            results.push({ content: `User: ${ex.user.slice(0, 200)} → Assistant: ${ex.assistant.slice(0, 200)}`, source: 'exchange', relevance: 70 });
+            const imp = ex.importance ? Math.round(ex.importance * 100) : 70;
+            results.push({
+                content: `User: ${ex.user.slice(0, 200)} → Assistant: ${ex.assistant.slice(0, 200)}`,
+                source: 'exchange',
+                relevance: imp,
+            });
         }
-        return results.slice(0, limit);
+        return results.sort((a, b) => b.relevance - a.relevance).slice(0, limit);
     }
 
     // ── Self-entity ──────────────────────────────────
@@ -178,11 +482,17 @@ export class MemoryStore {
 
     addSelfObservation(content: string): void {
         const self = this.getSelfEntity();
-        if (!self.facts.some(f => f.toLowerCase() === content.toLowerCase())) {
-            self.facts.push(content);
-            self.lastSeen = Date.now();
-            this.dirty = true;
+        const match = self.facts.find(f => f.content.toLowerCase() === content.toLowerCase());
+        if (match) {
+            // Reinforce existing observation
+            match.sources++;
+            match.lastConfirmed = Date.now();
+            match.confidence = computeConfidence(match.sources, match.lastConfirmed);
+        } else {
+            self.facts.push(createFact(content));
         }
+        self.lastSeen = Date.now();
+        this.dirty = true;
     }
 
     // ── Stats ────────────────────────────────────────
@@ -192,6 +502,176 @@ export class MemoryStore {
     get exchangeCount(): number { return this.exchanges.length; }
 
     private key(name: string): string { return name.toLowerCase().trim(); }
+
+    /** Refresh confidence scores on all facts (call periodically or on read). */
+    refreshConfidence(): void {
+        for (const entity of this.entities.values()) {
+            for (const f of entity.facts) {
+                f.confidence = computeConfidence(f.sources, f.lastConfirmed);
+            }
+        }
+    }
+
+    // ── Consolidation ────────────────────────────────
+
+    /**
+     * Run memory consolidation: refresh confidence, prune stale low-confidence
+     * facts, remove orphan relations, and detect near-duplicate entities.
+     * Returns a report of changes made.
+     */
+    consolidate(opts: {
+        /** Minimum confidence to keep a fact (default: 0.15) */
+        minConfidence?: number;
+        /** Max age in days for low-confidence facts before pruning (default: 60) */
+        maxStaleDays?: number;
+        /** Confidence threshold below which old facts are pruned (default: 0.3) */
+        staleConfidenceThreshold?: number;
+    } = {}): ConsolidationReport {
+        const minConf = opts.minConfidence ?? 0.15;
+        const maxStaleDays = opts.maxStaleDays ?? 60;
+        const staleConfThreshold = opts.staleConfidenceThreshold ?? 0.3;
+        const now = Date.now();
+
+        const report: ConsolidationReport = {
+            factsRefreshed: 0, factsPruned: 0, entitiesRemoved: 0,
+            relationsRemoved: 0, duplicatesFound: [],
+        };
+
+        // 1. Refresh all confidence scores
+        for (const entity of this.entities.values()) {
+            for (const f of entity.facts) {
+                const old = f.confidence;
+                f.confidence = computeConfidence(f.sources, f.lastConfirmed);
+                if (f.confidence !== old) report.factsRefreshed++;
+            }
+        }
+
+        // Entity types that should NEVER have facts pruned automatically.
+        // These represent durable knowledge that remains valid over time.
+        const PROTECTED_TYPES = new Set<string>([
+            'agent-self', 'person', 'project', 'preference', 'decision',
+            'organization', 'skill', 'constraint',
+        ]);
+
+        // 2. Prune stale low-confidence facts (only on non-protected entities)
+        for (const entity of this.entities.values()) {
+            if (PROTECTED_TYPES.has(entity.type)) continue;
+            const before = entity.facts.length;
+            entity.facts = entity.facts.filter(f => {
+                const ageDays = (now - f.lastConfirmed) / (1000 * 60 * 60 * 24);
+                // Keep if: high enough confidence, OR recently confirmed, OR has multiple sources
+                if (f.confidence >= staleConfThreshold) return true;
+                if (ageDays < maxStaleDays) return true;
+                if (f.sources >= 2) return true;
+                // Below minimum confidence threshold: prune
+                if (f.confidence < minConf) return false;
+                return true;
+            });
+            report.factsPruned += before - entity.facts.length;
+        }
+
+        // 3. Remove entities with no facts remaining (except self-entity)
+        const emptyEntities: string[] = [];
+        for (const [key, entity] of this.entities) {
+            if (entity.type === 'agent-self') continue;
+            if (entity.facts.length === 0) emptyEntities.push(key);
+        }
+        for (const key of emptyEntities) {
+            this.entities.delete(key);
+            report.entitiesRemoved++;
+        }
+
+        // 4. Remove orphan relations (referencing deleted entities)
+        const beforeRels = this.relations.length;
+        this.relations = this.relations.filter(r =>
+            this.entities.has(this.key(r.from)) && this.entities.has(this.key(r.to)));
+        report.relationsRemoved = beforeRels - this.relations.length;
+
+        // 5. Detect near-duplicate entities (Jaccard similarity on normalized names)
+        const names = Array.from(this.entities.keys());
+        for (let i = 0; i < names.length; i++) {
+            for (let j = i + 1; j < names.length; j++) {
+                const sim = jaccardSimilarity(names[i], names[j]);
+                if (sim > 0.7) {
+                    const eA = this.entities.get(names[i])!;
+                    const eB = this.entities.get(names[j])!;
+                    // Only flag same-type entities
+                    if (eA.type === eB.type) {
+                        report.duplicatesFound.push({ entityA: eA.name, entityB: eB.name, similarity: sim });
+                    }
+                }
+            }
+        }
+
+        if (report.factsPruned > 0 || report.entitiesRemoved > 0 || report.relationsRemoved > 0) {
+            this.dirty = true;
+        }
+
+        return report;
+    }
+
+    // ── Stale entity detection ───────────────────────
+
+    /**
+     * Find entities that haven't been accessed or confirmed recently.
+     * Useful for automated verification jobs.
+     */
+    getStaleEntities(opts: {
+        /** Max age in days since lastSeen (default: 30) */
+        maxAgeDays?: number;
+        /** Only return specific types */
+        types?: EntityType[];
+        /** Max results */
+        limit?: number;
+    } = {}): Entity[] {
+        const maxAge = (opts.maxAgeDays ?? 30) * 24 * 60 * 60 * 1000;
+        const cutoff = Date.now() - maxAge;
+        const results: Entity[] = [];
+
+        for (const entity of this.entities.values()) {
+            if (entity.type === 'agent-self') continue;
+            if (opts.types && !opts.types.includes(entity.type)) continue;
+            if (entity.lastSeen < cutoff) results.push(entity);
+        }
+
+        // Sort by stalest first
+        results.sort((a, b) => a.lastSeen - b.lastSeen);
+        return opts.limit ? results.slice(0, opts.limit) : results;
+    }
+
+    // ── File verification ────────────────────────────
+
+    /**
+     * Verify file-type entities against the actual filesystem.
+     * Marks missing files with an auto-verified fact.
+     * Runs server-side for direct fs access (no HTTP round-trips).
+     */
+    async verifyFileEntities(maxFiles = 50): Promise<{ filesChecked: number; filesMissing: number; factsMarked: number }> {
+        const { access } = await import('fs/promises');
+        const stats = { filesChecked: 0, filesMissing: 0, factsMarked: 0 };
+
+        const fileEntities = Array.from(this.entities.values()).filter(e => e.type === 'file');
+        for (const entity of fileEntities.slice(0, maxFiles)) {
+            const filePath = extractFilePath(entity);
+            if (!filePath) continue;
+            stats.filesChecked++;
+            try {
+                await access(filePath);
+            } catch {
+                stats.filesMissing++;
+                // Check if we already marked this — avoid duplicate warnings
+                const alreadyMarked = entity.facts.some(f => f.content.includes('[auto-verified] File not found'));
+                if (!alreadyMarked) {
+                    this.addEntity(entity.name, entity.type, [
+                        `[auto-verified] File not found at ${filePath} — may have been moved or deleted`,
+                    ]);
+                    stats.factsMarked++;
+                }
+            }
+        }
+        if (stats.factsMarked > 0) this.dirty = true;
+        return stats;
+    }
 
     private ensureSelfEntity(): void {
         if (!this.entities.has(this.key(SELF_ENTITY_NAME))) {

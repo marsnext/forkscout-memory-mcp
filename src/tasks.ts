@@ -21,10 +21,15 @@ export class TaskManager {
     create(title: string, goal: string, opts?: {
         budgetRemaining?: number;
         successCondition?: string;
+        priority?: number;
+        importance?: number;
     }): ActiveTask {
         const similar = this.findSimilar(title, goal);
         if (similar && similar.status === 'running') {
             similar.lastStepAt = Date.now();
+            // Update priority/importance if provided
+            if (opts?.priority !== undefined) similar.priority = opts.priority;
+            if (opts?.importance !== undefined) similar.importance = opts.importance;
             this._dirty = true;
             return similar;
         }
@@ -34,6 +39,8 @@ export class TaskManager {
             startedAt: Date.now(), lastStepAt: Date.now(),
             budgetRemaining: opts?.budgetRemaining,
             successCondition: opts?.successCondition,
+            priority: opts?.priority,
+            importance: opts?.importance,
         };
         this.tasks.push(task);
         this._dirty = true;
@@ -113,9 +120,13 @@ export class TaskManager {
         const lines: string[] = ['[Active Tasks]'];
         for (const t of running) {
             const elapsed = Math.round((Date.now() - t.startedAt) / 60000);
-            lines.push(`▸ ${t.title} (running ${elapsed}min) — ${t.goal}`);
+            const pStr = t.priority !== undefined ? ` P${Math.round(t.priority * 100)}` : '';
+            lines.push(`\u25b8 ${t.title}${pStr} (running ${elapsed}min) \u2014 ${t.goal}`);
         }
-        for (const t of paused) lines.push(`▹ ${t.title} (paused) — ${t.goal}`);
+        for (const t of paused) {
+            const pStr = t.priority !== undefined ? ` P${Math.round(t.priority * 100)}` : '';
+            lines.push(`\u25b9 ${t.title}${pStr} (paused) \u2014 ${t.goal}`);
+        }
         return lines.join('\n');
     }
 

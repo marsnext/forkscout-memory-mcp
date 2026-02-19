@@ -5,24 +5,38 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { MemoryStore } from './store.js';
+import type { ConsolidationReport, ContradictionWarning } from './store.js';
 import { RELATION_TYPES } from './types.js';
+
+/** Format contradiction warnings into a readable string. */
+function formatContradictions(warnings: ContradictionWarning[]): string {
+    if (warnings.length === 0) return '';
+    return '\n⚠️ CONTRADICTIONS DETECTED:\n' + warnings.map(w =>
+        `  • "${w.existingFact}" vs "${w.newFact}" — ${w.reason}`
+    ).join('\n');
+}
 
 export function registerTools(server: McpServer, store: MemoryStore): void {
     // ── Knowledge ────────────────────────────────────
 
-    server.tool('save_knowledge', {
+    server.tool('save_knowledge', 'Save a fact or observation to long-term memory. Facts are stored in the knowledge graph and can be searched later.', {
         fact: z.string().describe('Fact to store. Be specific and self-contained.'),
         category: z.string().optional().describe('Category: user-preference, project-context, decision, etc.'),
     }, async ({ fact, category }) => {
         const tagged = category ? `[${category}] ${fact}` : fact;
         const hits = store.searchEntities(fact, 1);
-        if (hits.length > 0) store.addEntity(hits[0].name, hits[0].type, [tagged]);
-        else store.addEntity(category || 'knowledge', 'concept', [tagged]);
+        let contradictions: ContradictionWarning[] = [];
+        if (hits.length > 0) {
+            const result = store.addEntity(hits[0].name, hits[0].type, [tagged]);
+            contradictions = result.contradictions;
+        } else {
+            store.addEntity(category || 'knowledge', 'concept', [tagged]);
+        }
         await store.flush();
-        return { content: [{ type: 'text' as const, text: `Saved: ${fact}` }] };
+        return { content: [{ type: 'text' as const, text: `Saved: ${fact}${formatContradictions(contradictions)}` }] };
     });
 
-    server.tool('search_knowledge', {
+    server.tool('search_knowledge', 'Search long-term memory for facts, entities, and past conversations. Returns ranked results by relevance.', {
         query: z.string().describe('Natural language search query.'),
         limit: z.number().optional().describe('Max results (default: 5).'),
     }, async ({ query, limit }) => {
@@ -35,53 +49,64 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Entities ─────────────────────────────────────
 
-    server.tool('add_entity', {
+    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph.', {
         name: z.string().describe('Entity name'),
         type: z.enum(['person', 'project', 'technology', 'preference', 'concept', 'file', 'service', 'organization', 'other']),
         facts: z.array(z.string()).describe('Facts about this entity'),
     }, async ({ name, type, facts }) => {
-        const e = store.addEntity(name, type, facts);
+        const { entity: e, contradictions } = store.addEntity(name, type, facts);
         await store.flush();
-        return { content: [{ type: 'text' as const, text: `Entity "${e.name}" (${e.type}): ${e.facts.length} facts` }] };
+        return { content: [{ type: 'text' as const, text: `Entity "${e.name}" (${e.type}): ${e.facts.length} facts${formatContradictions(contradictions)}` }] };
     });
 
-    server.tool('search_entities', {
+    server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their facts.', {
         query: z.string().describe('Search query'),
         limit: z.number().optional().describe('Max results (default: 5)'),
     }, async ({ query, limit }) => {
         const hits = store.searchEntities(query, limit || 5);
         const text = hits.length === 0
             ? 'No matching entities.'
-            : hits.map(e => `• ${e.name} (${e.type}): ${e.facts.slice(0, 5).join('; ')}`).join('\n');
+            : hits.map(e => {
+                const topFacts = [...e.facts].sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+                const factsStr = topFacts.map(f => `${f.content} [${Math.round(f.confidence * 100)}%]`).join('; ');
+                return `• ${e.name} (${e.type}): ${factsStr}`;
+            }).join('\n');
         return { content: [{ type: 'text' as const, text }] };
     });
 
-    server.tool('get_entity', {
+    server.tool('get_entity', 'Get a specific entity by exact name, returning all its facts and metadata.', {
         name: z.string().describe('Entity name to look up'),
     }, async ({ name }) => {
         const e = store.getEntity(name);
         if (!e) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
-        return { content: [{ type: 'text' as const, text: `${e.name} (${e.type}, seen ${e.accessCount}x):\n${e.facts.map(f => `  • ${f}`).join('\n')}` }] };
+        const factLines = [...e.facts]
+            .sort((a, b) => b.confidence - a.confidence)
+            .map(f => `  • [${Math.round(f.confidence * 100)}%] ${f.content} (${f.sources}x confirmed)`)
+            .join('\n');
+        return { content: [{ type: 'text' as const, text: `${e.name} (${e.type}, seen ${e.accessCount}x):\n${factLines}` }] };
     });
 
     // ── Tasks ────────────────────────────────────────
 
-    server.tool('start_task', {
+    server.tool('start_task', 'Start tracking an active task. Resumes if a similar task already exists. Used for executive memory.', {
         title: z.string().describe('Short label (3-7 words)'),
         goal: z.string().describe('What you are trying to accomplish'),
         successCondition: z.string().optional().describe('How to know when done'),
-    }, async ({ title, goal, successCondition }) => {
+        priority: z.number().min(0).max(1).optional().describe('Priority 0-1. Higher = more important/urgent.'),
+        importance: z.number().min(0).max(1).optional().describe('Long-term importance 0-1. Higher = more significant to remember.'),
+    }, async ({ title, goal, successCondition, priority, importance }) => {
         const similar = store.tasks.findSimilar(title, goal);
         if (similar && similar.status === 'running') {
             store.tasks.heartbeat(similar.id);
             return { content: [{ type: 'text' as const, text: `⚡ Resuming "${similar.title}" (${similar.id}) — already running` }] };
         }
-        const task = store.tasks.create(title, goal, { successCondition });
+        const task = store.tasks.create(title, goal, { successCondition, priority, importance });
         await store.flush();
-        return { content: [{ type: 'text' as const, text: `✓ Started: "${task.title}" (${task.id})` }] };
+        const pStr = priority !== undefined ? ` P${Math.round(priority * 100)}` : '';
+        return { content: [{ type: 'text' as const, text: `✓ Started: "${task.title}" (${task.id})${pStr}` }] };
     });
 
-    server.tool('complete_task', {
+    server.tool('complete_task', 'Mark a task as completed with an optional outcome summary.', {
         taskId: z.string().describe('Task ID'),
         result: z.string().optional().describe('Outcome summary'),
     }, async ({ taskId, result }) => {
@@ -92,7 +117,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: `✓ Completed "${task.title}" in ${mins}min` }] };
     });
 
-    server.tool('abort_task', {
+    server.tool('abort_task', 'Abort a running task and record the reason it was stopped.', {
         taskId: z.string().describe('Task ID'),
         reason: z.string().describe('Why the task was stopped'),
     }, async ({ taskId, reason }) => {
@@ -102,7 +127,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: `✗ Aborted "${task.title}": ${reason}` }] };
     });
 
-    server.tool('check_tasks', {}, async () => {
+    server.tool('check_tasks', 'List all active tasks with their status, duration, and goals.', {}, async () => {
         const summary = store.tasks.summary();
         const text = summary
             ? `${summary}\n\nTotal: ${store.tasks.totalCount} (${store.tasks.runningCount} running)`
@@ -112,7 +137,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Stats ────────────────────────────────────────
 
-    server.tool('memory_stats', {}, async () => {
+    server.tool('memory_stats', 'Show memory statistics: entity count, relation count, exchange count, active tasks, and type breakdown.', {}, async () => {
         const entities = store.getAllEntities();
         const types = new Map<string, number>();
         for (const e of entities) types.set(e.type, (types.get(e.type) || 0) + 1);
@@ -127,17 +152,18 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Agent internal tools (exchange tracking, relations, self-identity) ──
 
-    server.tool('add_exchange', {
+    server.tool('add_exchange', 'Record a user/assistant conversation exchange for later recall and context building.', {
         user: z.string().describe('User message text'),
         assistant: z.string().describe('Assistant response text'),
         sessionId: z.string().describe('Session identifier'),
-    }, async ({ user, assistant, sessionId }) => {
-        store.addExchange(user, assistant, sessionId);
+        importance: z.number().min(0).max(1).optional().describe('Importance score 0-1 (default: auto). Higher = more likely to surface in search.'),
+    }, async ({ user, assistant, sessionId, importance }) => {
+        store.addExchange(user, assistant, sessionId, importance);
         await store.flush();
-        return { content: [{ type: 'text' as const, text: 'Exchange recorded.' }] };
+        return { content: [{ type: 'text' as const, text: `Exchange recorded${importance !== undefined ? ` (importance: ${Math.round(importance * 100)}%)` : ''}.` }] };
     });
 
-    server.tool('search_exchanges', {
+    server.tool('search_exchanges', 'Search past conversation exchanges by content. Returns matching user/assistant message pairs.', {
         query: z.string().describe('Search query'),
         limit: z.number().optional().describe('Max results (default: 5)'),
     }, async ({ query, limit }) => {
@@ -146,7 +172,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: JSON.stringify(hits) }] };
     });
 
-    server.tool('add_relation', {
+    server.tool('add_relation', 'Create a typed relationship between two entities in the knowledge graph (e.g. "Alice uses TypeScript").', {
         from: z.string().describe('Source entity name'),
         to: z.string().describe('Target entity name'),
         type: z.enum(RELATION_TYPES).describe('Relation type'),
@@ -156,10 +182,11 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         if (!store.getEntity(to)) store.addEntity(to, 'other', []);
         const rel = store.addRelation(from, type, to);
         await store.flush();
-        return { content: [{ type: 'text' as const, text: `Relation: ${from} → ${rel.type} → ${to}` }] };
+        const wStr = rel.evidenceCount > 1 ? ` (weight: ${Math.round(rel.weight * 100)}%, ${rel.evidenceCount}x confirmed)` : '';
+        return { content: [{ type: 'text' as const, text: `Relation: ${from} → ${rel.type} → ${to}${wStr}` }] };
     });
 
-    server.tool('get_all_entities', {
+    server.tool('get_all_entities', 'List all entities in the knowledge graph with their types and facts.', {
         limit: z.number().optional().describe('Max entities to return'),
     }, async ({ limit }) => {
         const all = store.getAllEntities();
@@ -167,16 +194,16 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: JSON.stringify(subset) }] };
     });
 
-    server.tool('get_all_relations', {}, async () => {
+    server.tool('get_all_relations', 'List all relationships between entities in the knowledge graph.', {}, async () => {
         return { content: [{ type: 'text' as const, text: JSON.stringify(store.getAllRelations()) }] };
     });
 
-    server.tool('get_self_entity', {}, async () => {
+    server.tool('get_self_entity', 'Get the agent\'s own identity entity with all learned facts and self-observations.', {}, async () => {
         const self = store.getSelfEntity();
         return { content: [{ type: 'text' as const, text: JSON.stringify(self) }] };
     });
 
-    server.tool('self_observe', {
+    server.tool('self_observe', 'Record a self-observation or learned behavior on the agent\'s own identity entity.', {
         content: z.string().describe('Self-observation text'),
     }, async ({ content }) => {
         store.addSelfObservation(content);
@@ -184,11 +211,49 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: `Self-observation recorded.` }] };
     });
 
-    server.tool('clear_all', {
-        reason: z.string().describe('Why — this is logged'),
-    }, async ({ reason }) => {
-        console.log(`⚠️ Memory clear requested: ${reason}`);
-        await store.clear();
-        return { content: [{ type: 'text' as const, text: `All memory cleared. Reason: ${reason}` }] };
+    // ── Memory intelligence tools ────────────────────
+
+    server.tool('consolidate_memory', 'Run memory consolidation: refresh confidence scores, prune stale low-confidence facts, remove orphan relations, detect near-duplicate entities. Call periodically for memory hygiene.', {
+        minConfidence: z.number().min(0).max(1).optional().describe('Minimum confidence to keep a fact (default: 0.15)'),
+        maxStaleDays: z.number().optional().describe('Max age in days for low-confidence facts before pruning (default: 60)'),
+    }, async ({ minConfidence, maxStaleDays }) => {
+        const report = store.consolidate({ minConfidence, maxStaleDays });
+        await store.flush();
+        const lines: string[] = [
+            `Consolidation complete:`,
+            `  Confidence refreshed: ${report.factsRefreshed} facts`,
+            `  Facts pruned: ${report.factsPruned}`,
+            `  Empty entities removed: ${report.entitiesRemoved}`,
+            `  Orphan relations removed: ${report.relationsRemoved}`,
+        ];
+        if (report.duplicatesFound.length > 0) {
+            lines.push(`  Potential duplicates:`);
+            for (const d of report.duplicatesFound) {
+                lines.push(`    • "${d.entityA}" ≈ "${d.entityB}" (${Math.round(d.similarity * 100)}% similar)`);
+            }
+        }
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     });
+
+    server.tool('get_stale_entities', 'Find entities that haven\'t been accessed or confirmed recently. Useful for identifying outdated information that needs verification.', {
+        maxAgeDays: z.number().optional().describe('Max age in days since last seen (default: 30)'),
+        types: z.array(z.string()).optional().describe('Only return specific entity types (e.g. ["file", "technology"])'),
+        limit: z.number().optional().describe('Max results (default: 20)'),
+    }, async ({ maxAgeDays, types, limit }) => {
+        const stale = store.getStaleEntities({
+            maxAgeDays,
+            types: types as any,
+            limit: limit ?? 20,
+        });
+        if (stale.length === 0) return { content: [{ type: 'text' as const, text: 'No stale entities found.' }] };
+        const lines = stale.map(e => {
+            const days = Math.round((Date.now() - e.lastSeen) / (1000 * 60 * 60 * 24));
+            const topFact = e.facts.length > 0 ? e.facts[0].content.slice(0, 80) : '(no facts)';
+            return `• ${e.name} (${e.type}) — ${days}d stale, ${e.accessCount} accesses — ${topFact}`;
+        });
+        return { content: [{ type: 'text' as const, text: `${stale.length} stale entities:\n${lines.join('\n')}` }] };
+    });
+
+    // clear_all intentionally removed — too destructive to expose as an agent-callable tool.
+    // Memory can still be cleared via the admin HTTP endpoint POST /api/memory/clear.
 }
