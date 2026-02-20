@@ -49,44 +49,45 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Entities ─────────────────────────────────────
 
-    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph. Contradictory old facts are automatically superseded by new ones.', {
+    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph. Contradictory old facts are automatically superseded (marked as historical) by new ones — they are retained for learning, not deleted.', {
         name: z.string().describe('Entity name'),
         type: z.enum(['person', 'project', 'technology', 'preference', 'concept', 'file', 'service', 'organization', 'other']),
         facts: z.array(z.string()).describe('Facts about this entity'),
     }, async ({ name, type, facts }) => {
         const { entity: e, contradictions } = store.addEntity(name, type, facts);
-        // Immediately prune superseded facts so they don't linger
-        const pruned = store.pruneSuperseded(name);
         await store.flush();
-        let text = `Entity "${e.name}" (${e.type}): ${e.facts.length} facts`;
-        if (pruned > 0) text += ` (${pruned} old contradictory fact(s) replaced)`;
+        const activeFacts = e.facts.filter(f => f.status === 'active').length;
+        const supersededFacts = e.facts.filter(f => f.status === 'superseded').length;
+        let text = `Entity "${e.name}" (${e.type}): ${activeFacts} active facts`;
+        if (supersededFacts > 0) text += `, ${supersededFacts} historical`;
+        if (contradictions.length > 0) text += ` (${contradictions.length} old fact(s) superseded — retained as history)`;
         text += formatContradictions(contradictions);
         return { content: [{ type: 'text' as const, text }] };
     });
 
-    server.tool('update_entity', 'Replace a specific fact on an entity. Use when correcting wrong information. Finds facts containing oldFact substring and replaces with newFact.', {
+    server.tool('update_entity', 'Replace a specific fact on an entity. Use when correcting wrong information. Old facts are superseded (retained as history for learning), not deleted. Finds active facts containing oldFact substring and supersedes them.', {
         name: z.string().describe('Entity name'),
-        oldFact: z.string().describe('Substring of the old/wrong fact to find and remove'),
+        oldFact: z.string().describe('Substring of the old/wrong fact to find and supersede'),
         newFact: z.string().describe('New correct fact to add'),
     }, async ({ name, oldFact, newFact }) => {
         const { removed, added } = store.replaceFact(name, oldFact, newFact);
         await store.flush();
         if (removed === 0 && !added) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
-        if (removed === 0) return { content: [{ type: 'text' as const, text: `No facts matching "${oldFact}" found on "${name}". Added new fact anyway.` }] };
-        return { content: [{ type: 'text' as const, text: `Updated "${name}": removed ${removed} old fact(s) matching "${oldFact}", added: "${newFact}"` }] };
+        if (removed === 0) return { content: [{ type: 'text' as const, text: `No active facts matching "${oldFact}" found on "${name}". Added new fact anyway.` }] };
+        return { content: [{ type: 'text' as const, text: `Updated "${name}": superseded ${removed} old fact(s) matching "${oldFact}" (retained as history), added: "${newFact}"` }] };
     });
 
-    server.tool('remove_fact', 'Remove specific facts from an entity by substring match. Use to clean up wrong or outdated information.', {
+    server.tool('remove_fact', 'Supersede (mark as historical) specific facts from an entity by substring match. Facts are retained for learning history, not permanently deleted.', {
         name: z.string().describe('Entity name'),
-        factSubstring: z.string().describe('Substring to match against facts — all matching facts will be removed'),
+        factSubstring: z.string().describe('Substring to match against active facts — matching facts will be superseded'),
     }, async ({ name, factSubstring }) => {
-        const removed = store.removeFact(name, factSubstring);
+        const superseded = store.removeFact(name, factSubstring);
         await store.flush();
-        if (removed === 0) return { content: [{ type: 'text' as const, text: `No facts matching "${factSubstring}" found on entity "${name}".` }] };
-        return { content: [{ type: 'text' as const, text: `Removed ${removed} fact(s) matching "${factSubstring}" from "${name}".` }] };
+        if (superseded === 0) return { content: [{ type: 'text' as const, text: `No active facts matching "${factSubstring}" found on entity "${name}".` }] };
+        return { content: [{ type: 'text' as const, text: `Superseded ${superseded} fact(s) matching "${factSubstring}" from "${name}" (retained as history).` }] };
     });
 
-    server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their facts.', {
+    server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their active (current) facts.', {
         query: z.string().describe('Search query'),
         limit: z.number().optional().describe('Max results (default: 5)'),
     }, async ({ query, limit }) => {
@@ -94,23 +95,40 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         const text = hits.length === 0
             ? 'No matching entities.'
             : hits.map(e => {
-                const topFacts = [...e.facts].sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+                const activeFacts = e.facts.filter(f => f.status === 'active');
+                const topFacts = [...activeFacts].sort((a, b) => b.confidence - a.confidence).slice(0, 5);
                 const factsStr = topFacts.map(f => `${f.content} [${Math.round(f.confidence * 100)}%]`).join('; ');
-                return `• ${e.name} (${e.type}): ${factsStr}`;
+                const supersededCount = e.facts.filter(f => f.status === 'superseded').length;
+                const historyNote = supersededCount > 0 ? ` [${supersededCount} historical]` : '';
+                return `• ${e.name} (${e.type})${historyNote}: ${factsStr}`;
             }).join('\n');
         return { content: [{ type: 'text' as const, text }] };
     });
 
-    server.tool('get_entity', 'Get a specific entity by exact name, returning all its facts and metadata.', {
+    server.tool('get_entity', 'Get a specific entity by exact name. Shows active (current) facts by default. Use get_fact_history to see how beliefs evolved.', {
         name: z.string().describe('Entity name to look up'),
-    }, async ({ name }) => {
+        includeHistory: z.boolean().optional().describe('Include superseded (historical) facts (default: false)'),
+    }, async ({ name, includeHistory }) => {
         const e = store.getEntity(name);
         if (!e) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
-        const factLines = [...e.facts]
+        const activeFacts = e.facts.filter(f => f.status === 'active');
+        const supersededFacts = e.facts.filter(f => f.status === 'superseded');
+        const activeLines = [...activeFacts]
             .sort((a, b) => b.confidence - a.confidence)
             .map(f => `  • [${Math.round(f.confidence * 100)}%] ${f.content} (${f.sources}x confirmed)`)
             .join('\n');
-        return { content: [{ type: 'text' as const, text: `${e.name} (${e.type}, seen ${e.accessCount}x):\n${factLines}` }] };
+        let text = `${e.name} (${e.type}, seen ${e.accessCount}x, ${activeFacts.length} active, ${supersededFacts.length} historical):\n${activeLines}`;
+        if (includeHistory && supersededFacts.length > 0) {
+            const historyLines = [...supersededFacts]
+                .sort((a, b) => (b.supersededAt || 0) - (a.supersededAt || 0))
+                .map(f => {
+                    const when = f.supersededAt ? new Date(f.supersededAt).toISOString().slice(0, 10) : 'unknown';
+                    return `  ⤷ [superseded ${when}] ${f.content} → replaced by: ${f.supersededBy || 'unknown'}`;
+                })
+                .join('\n');
+            text += `\n\nHistory (superseded facts):\n${historyLines}`;
+        }
+        return { content: [{ type: 'text' as const, text }] };
     });
 
     // ── Tasks ────────────────────────────────────────
@@ -164,15 +182,21 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Stats ────────────────────────────────────────
 
-    server.tool('memory_stats', 'Show memory statistics: entity count, relation count, exchange count, active tasks, and type breakdown.', {}, async () => {
+    server.tool('memory_stats', 'Show memory statistics: entity count, relation count, exchange count, active tasks, fact breakdown (active vs superseded), and type breakdown.', {}, async () => {
         const entities = store.getAllEntities();
         const types = new Map<string, number>();
-        for (const e of entities) types.set(e.type, (types.get(e.type) || 0) + 1);
+        let totalActive = 0;
+        let totalSuperseded = 0;
+        for (const e of entities) {
+            types.set(e.type, (types.get(e.type) || 0) + 1);
+            totalActive += e.facts.filter(f => f.status === 'active').length;
+            totalSuperseded += e.facts.filter(f => f.status === 'superseded').length;
+        }
         const breakdown = Array.from(types.entries()).map(([t, c]) => `  ${t}: ${c}`).join('\n');
         return {
             content: [{
                 type: 'text' as const,
-                text: `Entities: ${store.entityCount}\nRelations: ${store.relationCount}\nExchanges: ${store.exchangeCount}\nActive tasks: ${store.tasks.runningCount}\n\nBreakdown:\n${breakdown || '  (none)'}`,
+                text: `Entities: ${store.entityCount}\nRelations: ${store.relationCount}\nExchanges: ${store.exchangeCount}\nActive tasks: ${store.tasks.runningCount}\nFacts: ${totalActive} active, ${totalSuperseded} superseded (historical)\n\nBreakdown:\n${breakdown || '  (none)'}`,
             }],
         };
     });
@@ -240,11 +264,49 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Memory intelligence tools ────────────────────
 
-    server.tool('consolidate_memory', 'Run memory consolidation: refresh confidence scores, prune stale low-confidence facts, remove orphan relations, detect near-duplicate entities. Call periodically for memory hygiene.', {
-        minConfidence: z.number().min(0).max(1).optional().describe('Minimum confidence to keep a fact (default: 0.15)'),
-        maxStaleDays: z.number().optional().describe('Max age in days for low-confidence facts before pruning (default: 60)'),
-    }, async ({ minConfidence, maxStaleDays }) => {
-        const report = store.consolidate({ minConfidence, maxStaleDays });
+    server.tool('get_fact_history', 'See how beliefs about an entity evolved over time. Shows supersession chains: which facts replaced which, and when. Useful for understanding learning patterns and past corrections.', {
+        name: z.string().describe('Entity name to inspect'),
+    }, async ({ name }) => {
+        const history = store.getFactHistory(name);
+        if (!history) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
+        if (history.superseded.length === 0) {
+            return { content: [{ type: 'text' as const, text: `"${name}" has ${history.active.length} active facts and no correction history.` }] };
+        }
+        const lines: string[] = [
+            `Fact history for "${name}":`,
+            `  Active facts: ${history.active.length}`,
+            `  Superseded facts: ${history.superseded.length}`,
+            `  Correction chains: ${history.chains.length}`,
+        ];
+        if (history.chains.length > 0) {
+            lines.push('');
+            for (const chain of history.chains) {
+                lines.push(`  ✓ Current: ${chain.current.content}`);
+                for (const prev of chain.previous) {
+                    const when = prev.supersededAt ? new Date(prev.supersededAt).toISOString().slice(0, 10) : '?';
+                    lines.push(`    ← Was: "${prev.content}" (superseded ${when}, had ${prev.sources}x confirmations)`);
+                }
+            }
+        }
+        // Show orphan superseded facts (no chain to a current active fact)
+        const chainedSuperseded = new Set(history.chains.flatMap(c => c.previous.map(p => p.content)));
+        const orphans = history.superseded.filter(s => !chainedSuperseded.has(s.content));
+        if (orphans.length > 0) {
+            lines.push(`\n  Orphan superseded facts (no current replacement):`);
+            for (const o of orphans) {
+                const when = o.supersededAt ? new Date(o.supersededAt).toISOString().slice(0, 10) : '?';
+                lines.push(`    ⤓ "${o.content}" → ${o.supersededBy || '(unknown replacement)'} (${when})`);
+            }
+        }
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    });
+
+    server.tool('consolidate_memory', 'Run memory consolidation: refresh confidence scores, archive very old superseded facts, prune stale low-confidence active facts, remove orphan relations, detect near-duplicate entities. Superseded facts are preserved for learning history (only archived after 180+ days by default).', {
+        minConfidence: z.number().min(0).max(1).optional().describe('Minimum confidence to keep an active fact (default: 0.15)'),
+        maxStaleDays: z.number().optional().describe('Max age in days for low-confidence active facts before pruning (default: 60)'),
+        archiveDays: z.number().optional().describe('Max age in days for superseded facts before archiving (default: 180)'),
+    }, async ({ minConfidence, maxStaleDays, archiveDays }) => {
+        const report = store.consolidate({ minConfidence, maxStaleDays, archiveDays });
         await store.flush();
         const lines: string[] = [
             `Consolidation complete:`,

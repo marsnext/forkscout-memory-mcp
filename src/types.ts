@@ -81,7 +81,9 @@ export const RELATION_TYPES = [
 
 export type RelationType = typeof RELATION_TYPES[number];
 
-// ── Structured fact with confidence ──────────────────
+// ── Structured fact with confidence & versioning ─────
+
+export type FactStatus = 'active' | 'superseded';
 
 export interface Fact {
     content: string;
@@ -93,6 +95,13 @@ export interface Fact {
     firstSeen: number;
     /** When last confirmed or reinforced. */
     lastConfirmed: number;
+    /** Lifecycle status: 'active' = current belief, 'superseded' = replaced by newer info.
+     *  Superseded facts are retained for learning history, not deleted. */
+    status: FactStatus;
+    /** Content of the fact that replaced this one (only set when superseded). */
+    supersededBy?: string;
+    /** When this fact was superseded. */
+    supersededAt?: number;
 }
 
 export interface Entity {
@@ -147,8 +156,17 @@ export interface ActiveTask {
 export const TASK_MAX_DURATION_MS = 2 * 60 * 60 * 1000;
 
 export interface MemoryData {
-    version: 5;
+    version: 6;
     entities: Entity[];
+    relations: Relation[];
+    exchanges: Exchange[];
+    activeTasks: ActiveTask[];
+}
+
+/** V5 shapes for migration (facts without status field) */
+export interface LegacyMemoryDataV5 {
+    version: 5;
+    entities: Array<{ name: string; type: EntityType; facts: Array<{ content: string; confidence: number; sources: number; firstSeen: number; lastConfirmed: number }>; lastSeen: number; accessCount: number }>;
     relations: Relation[];
     exchanges: Exchange[];
     activeTasks: ActiveTask[];

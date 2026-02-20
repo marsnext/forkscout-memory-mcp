@@ -5,7 +5,7 @@
 
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
-import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4 } from './types.js';
+import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5 } from './types.js';
 import { SELF_ENTITY_NAME } from './types.js';
 import { TaskManager } from './tasks.js';
 
@@ -60,10 +60,10 @@ function computeConfidence(sources: number, lastConfirmedMs: number): number {
 /** Create a new Fact from a plain string. */
 function createFact(content: string): Fact {
     const now = Date.now();
-    return { content, confidence: 1.0, sources: 1, firstSeen: now, lastConfirmed: now };
+    return { content, confidence: 1.0, sources: 1, firstSeen: now, lastConfirmed: now, status: 'active' };
 }
 
-/** Migrate a v4 string fact to a v5 structured Fact. */
+/** Migrate a v4 string fact to a structured Fact. */
 function migrateFact(content: string, entityLastSeen: number): Fact {
     return {
         content,
@@ -71,6 +71,32 @@ function migrateFact(content: string, entityLastSeen: number): Fact {
         sources: 1,
         firstSeen: entityLastSeen, // best guess — we don't have the original timestamp
         lastConfirmed: entityLastSeen,
+        status: 'active',
+    };
+}
+
+/** Migrate a v5 fact (no status field) to v6 format. Handles [SUPERSEDED] prefix cleanup. */
+function migrateFactV5toV6(f: { content: string; confidence: number; sources: number; firstSeen: number; lastConfirmed: number }): Fact {
+    const isSuperseded = f.content.startsWith('[SUPERSEDED');
+    // Clean up [SUPERSEDED by: ...] prefix — now tracked structurally, not in content
+    let content = f.content;
+    let supersededBy: string | undefined;
+    if (isSuperseded) {
+        const match = f.content.match(/^\[SUPERSEDED by: (.+?)\] (.+)$/);
+        if (match) {
+            supersededBy = match[1];
+            content = match[2];
+        }
+    }
+    return {
+        content,
+        confidence: isSuperseded ? f.confidence : f.confidence,
+        sources: f.sources,
+        firstSeen: f.firstSeen,
+        lastConfirmed: f.lastConfirmed,
+        status: isSuperseded ? 'superseded' : 'active',
+        supersededBy,
+        supersededAt: isSuperseded ? f.lastConfirmed : undefined,
     };
 }
 
@@ -253,8 +279,8 @@ export class MemoryStore {
             const data = JSON.parse(raw);
 
             if (data.version === 4 || !data.version) {
-                // ── v4 → v5 migration ────────────────────
-                console.log('🔄 Migrating memory v4 → v5 (structured facts, weighted relations)...');
+                // ── v4 → v6 migration ────────────────────
+                console.log('🔄 Migrating memory v4 → v6 (structured facts with versioning)...');
                 const v4 = data as LegacyMemoryDataV4;
                 for (const e of v4.entities) {
                     const migrated: Entity = {
@@ -269,15 +295,36 @@ export class MemoryStore {
                 this.relations = (v4.relations || []).map(migrateRelation);
                 this.exchanges = (v4.exchanges || []).map(migrateExchange);
                 this.tasks.load(v4.activeTasks || []);
-                this.dirty = true; // force flush to write v5 format
+                this.dirty = true;
                 console.log(`✅ Migrated ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} exchanges`);
-            } else {
-                // Already v5
-                const v5 = data as MemoryData;
-                for (const e of v5.entities) this.entities.set(this.key(e.name), e);
+            } else if (data.version === 5) {
+                // ── v5 → v6 migration (add status field, clean [SUPERSEDED] prefixes) ──
+                console.log('🔄 Migrating memory v5 → v6 (fact versioning)...');
+                const v5 = data as LegacyMemoryDataV5;
+                for (const e of v5.entities) {
+                    const migrated: Entity = {
+                        name: e.name,
+                        type: e.type,
+                        facts: e.facts.map(f => migrateFactV5toV6(f)),
+                        lastSeen: e.lastSeen,
+                        accessCount: e.accessCount,
+                    };
+                    this.entities.set(this.key(e.name), migrated);
+                }
                 this.relations = v5.relations || [];
                 this.exchanges = v5.exchanges || [];
                 this.tasks.load(v5.activeTasks || []);
+                this.dirty = true;
+                const supersededCount = Array.from(this.entities.values())
+                    .reduce((sum, e) => sum + e.facts.filter(f => f.status === 'superseded').length, 0);
+                console.log(`✅ Migrated ${this.entities.size} entities (${supersededCount} superseded facts preserved as history)`);
+            } else {
+                // Already v6
+                const v6 = data as MemoryData;
+                for (const e of v6.entities) this.entities.set(this.key(e.name), e);
+                this.relations = v6.relations || [];
+                this.exchanges = v6.exchanges || [];
+                this.tasks.load(v6.activeTasks || []);
             }
         } catch { /* start fresh */ }
         this.ensureSelfEntity();
@@ -297,7 +344,7 @@ export class MemoryStore {
         try {
             await mkdir(dirname(this.filePath), { recursive: true });
             const data: MemoryData = {
-                version: 5,
+                version: 6,
                 entities: Array.from(this.entities.values()),
                 relations: this.relations,
                 exchanges: this.exchanges.slice(-500),
@@ -326,16 +373,18 @@ export class MemoryStore {
 
         if (existing) {
             for (const f of facts) {
-                const match = existing.facts.find(ef => ef.content.toLowerCase() === f.toLowerCase());
+                const match = existing.facts.find(ef =>
+                    ef.status === 'active' && ef.content.toLowerCase() === f.toLowerCase());
                 if (match) {
-                    // Reinforce existing fact
+                    // Reinforce existing active fact
                     match.sources++;
                     match.lastConfirmed = Date.now();
                     match.confidence = computeConfidence(match.sources, match.lastConfirmed);
                 } else {
-                    // Check for contradictions — supersede old facts when found
+                    // Check for contradictions against ACTIVE facts only
                     const superseded: Fact[] = [];
                     for (const ef of existing.facts) {
+                        if (ef.status === 'superseded') continue; // skip already-superseded facts
                         const warning = checkContradiction(ef, f);
                         if (warning) {
                             warning.entity = name;
@@ -343,13 +392,15 @@ export class MemoryStore {
                             superseded.push(ef);
                         }
                     }
-                    // Supersede contradicted facts: drastically reduce confidence so they
-                    // get pruned during next consolidation, and mark them as superseded
+                    // Mark contradicted facts as superseded — retain for learning history
+                    // Confidence is preserved (historical record), content unchanged
+                    const now = Date.now();
                     for (const old of superseded) {
-                        old.confidence = 0.05;
-                        old.content = `[SUPERSEDED by: ${f.slice(0, 80)}] ${old.content}`;
+                        old.status = 'superseded';
+                        old.supersededBy = f;
+                        old.supersededAt = now;
                     }
-                    // Add the new (correct) fact
+                    // Add the new (correct) fact as active
                     existing.facts.push(createFact(f));
                 }
             }
@@ -383,26 +434,36 @@ export class MemoryStore {
     getAllEntities(): Entity[] { return Array.from(this.entities.values()); }
 
     /**
-     * Remove a specific fact from an entity by substring match.
-     * Returns the number of facts removed.
+     * Supersede facts on an entity by substring match.
+     * Facts are marked as superseded (retained for history), NOT deleted.
+     * Returns the number of facts superseded.
      */
-    removeFact(entityName: string, factSubstring: string): number {
+    removeFact(entityName: string, factSubstring: string, replacedBy?: string): number {
         const entity = this.entities.get(this.key(entityName));
         if (!entity) return 0;
         const lower = factSubstring.toLowerCase();
-        const before = entity.facts.length;
-        entity.facts = entity.facts.filter(f => !f.content.toLowerCase().includes(lower));
-        const removed = before - entity.facts.length;
-        if (removed > 0) this.dirty = true;
-        return removed;
+        const now = Date.now();
+        let count = 0;
+        for (const f of entity.facts) {
+            if (f.status === 'superseded') continue; // already superseded
+            if (f.content.toLowerCase().includes(lower)) {
+                f.status = 'superseded';
+                f.supersededBy = replacedBy || `[manually removed: "${factSubstring}"]`;
+                f.supersededAt = now;
+                count++;
+            }
+        }
+        if (count > 0) this.dirty = true;
+        return count;
     }
 
     /**
      * Replace facts matching a substring with a new fact.
-     * Returns { removed: number, added: boolean }.
+     * Old facts are marked as superseded (retained for history).
+     * Returns { superseded: number, added: boolean }.
      */
     replaceFact(entityName: string, oldFactSubstring: string, newFact: string): { removed: number; added: boolean } {
-        const removed = this.removeFact(entityName, oldFactSubstring);
+        const removed = this.removeFact(entityName, oldFactSubstring, newFact);
         const entity = this.entities.get(this.key(entityName));
         if (!entity) return { removed: 0, added: false };
         entity.facts.push(createFact(newFact));
@@ -412,20 +473,57 @@ export class MemoryStore {
     }
 
     /**
-     * Clean up superseded facts from an entity (remove facts prefixed with [SUPERSEDED]).
+     * Get fact history for an entity — shows how beliefs evolved over time.
+     * Returns all facts (active + superseded), grouped by supersession chains.
      */
-    pruneSuperseded(entityName?: string): number {
-        let pruned = 0;
-        const targets = entityName
-            ? [this.entities.get(this.key(entityName))].filter(Boolean) as Entity[]
-            : Array.from(this.entities.values());
-        for (const entity of targets) {
-            const before = entity.facts.length;
-            entity.facts = entity.facts.filter(f => !f.content.startsWith('[SUPERSEDED'));
-            pruned += before - entity.facts.length;
+    getFactHistory(entityName: string): { active: Fact[]; superseded: Fact[]; chains: Array<{ current: Fact; previous: Fact[] }> } | null {
+        const entity = this.entities.get(this.key(entityName));
+        if (!entity) return null;
+
+        const active = entity.facts.filter(f => f.status === 'active');
+        const superseded = entity.facts.filter(f => f.status === 'superseded');
+
+        // Build supersession chains: active fact ← superseded facts that led to it
+        const chains: Array<{ current: Fact; previous: Fact[] }> = [];
+        for (const fact of active) {
+            const predecessors = superseded.filter(s => s.supersededBy === fact.content);
+            if (predecessors.length > 0) {
+                chains.push({ current: fact, previous: predecessors.sort((a, b) => (a.supersededAt || 0) - (b.supersededAt || 0)) });
+            }
         }
-        if (pruned > 0) this.dirty = true;
-        return pruned;
+
+        return { active, superseded, chains };
+    }
+
+    /**
+     * Get active (non-superseded) facts for an entity.
+     * This is the "current belief" view.
+     */
+    getActiveFacts(entityName: string): Fact[] {
+        const entity = this.entities.get(this.key(entityName));
+        if (!entity) return [];
+        return entity.facts.filter(f => f.status === 'active');
+    }
+
+    /**
+     * Archive very old superseded facts (>archiveDays old) by removing them.
+     * This is the ONLY destructive operation — used for storage management, not correction.
+     * Default: archive superseded facts older than 180 days.
+     */
+    archiveOldSuperseded(archiveDays = 180): number {
+        const cutoff = Date.now() - archiveDays * 24 * 60 * 60 * 1000;
+        let archived = 0;
+        for (const entity of this.entities.values()) {
+            const before = entity.facts.length;
+            entity.facts = entity.facts.filter(f => {
+                if (f.status !== 'superseded') return true;
+                // Only archive if superseded long ago
+                return (f.supersededAt || f.lastConfirmed) > cutoff;
+            });
+            archived += before - entity.facts.length;
+        }
+        if (archived > 0) this.dirty = true;
+        return archived;
     }
 
     // ── Relations ────────────────────────────────────
@@ -487,6 +585,8 @@ export class MemoryStore {
             for (const t of terms) {
                 if (nameL.includes(t)) score += 2;
                 for (const f of entity.facts) {
+                    // Only ACTIVE facts contribute to search relevance
+                    if (f.status === 'superseded') continue;
                     if (f.content.toLowerCase().includes(t)) {
                         // Weight by confidence — high-confidence facts matter more
                         score += f.confidence;
@@ -534,13 +634,15 @@ export class MemoryStore {
     searchKnowledge(query: string, limit = 5): SearchResult[] {
         const results: SearchResult[] = [];
         for (const e of this.searchEntities(query, limit)) {
-            // Show top facts by confidence
+            // Show top ACTIVE facts by confidence
             const topFacts = [...e.facts]
+                .filter(f => f.status === 'active')
                 .sort((a, b) => b.confidence - a.confidence)
                 .slice(0, 5)
                 .map(f => f.content);
-            const avgConf = e.facts.length > 0
-                ? Math.round(e.facts.reduce((s, f) => s + f.confidence, 0) / e.facts.length * 100)
+            const activeFacts = e.facts.filter(f => f.status === 'active');
+            const avgConf = activeFacts.length > 0
+                ? Math.round(activeFacts.reduce((s, f) => s + f.confidence, 0) / activeFacts.length * 100)
                 : 0;
             results.push({
                 content: `${e.name} (${e.type}, ${avgConf}% conf): ${topFacts.join('; ')}`,
@@ -568,7 +670,8 @@ export class MemoryStore {
 
     addSelfObservation(content: string): void {
         const self = this.getSelfEntity();
-        const match = self.facts.find(f => f.content.toLowerCase() === content.toLowerCase());
+        const match = self.facts.find(f =>
+            f.status === 'active' && f.content.toLowerCase() === content.toLowerCase());
         if (match) {
             // Reinforce existing observation
             match.sources++;
@@ -589,10 +692,11 @@ export class MemoryStore {
 
     private key(name: string): string { return name.toLowerCase().trim(); }
 
-    /** Refresh confidence scores on all facts (call periodically or on read). */
+    /** Refresh confidence scores on all ACTIVE facts (call periodically or on read). */
     refreshConfidence(): void {
         for (const entity of this.entities.values()) {
             for (const f of entity.facts) {
+                if (f.status === 'superseded') continue; // preserve historical confidence
                 f.confidence = computeConfidence(f.sources, f.lastConfirmed);
             }
         }
@@ -601,8 +705,9 @@ export class MemoryStore {
     // ── Consolidation ────────────────────────────────
 
     /**
-     * Run memory consolidation: refresh confidence, prune stale low-confidence
-     * facts, remove orphan relations, and detect near-duplicate entities.
+     * Run memory consolidation: refresh confidence, archive very old superseded
+     * facts, prune stale low-confidence active facts on non-protected entities,
+     * remove orphan relations, and detect near-duplicate entities.
      * Returns a report of changes made.
      */
     consolidate(opts: {
@@ -612,10 +717,13 @@ export class MemoryStore {
         maxStaleDays?: number;
         /** Confidence threshold below which old facts are pruned (default: 0.3) */
         staleConfidenceThreshold?: number;
+        /** Max age in days for superseded facts before archiving (default: 180) */
+        archiveDays?: number;
     } = {}): ConsolidationReport {
         const minConf = opts.minConfidence ?? 0.15;
         const maxStaleDays = opts.maxStaleDays ?? 60;
         const staleConfThreshold = opts.staleConfidenceThreshold ?? 0.3;
+        const archiveDays = opts.archiveDays ?? 180;
         const now = Date.now();
 
         const report: ConsolidationReport = {
@@ -623,9 +731,10 @@ export class MemoryStore {
             relationsRemoved: 0, duplicatesFound: [],
         };
 
-        // 1. Refresh all confidence scores
+        // 1. Refresh all confidence scores (active facts only)
         for (const entity of this.entities.values()) {
             for (const f of entity.facts) {
+                if (f.status === 'superseded') continue; // preserve historical confidence
                 const old = f.confidence;
                 f.confidence = computeConfidence(f.sources, f.lastConfirmed);
                 if (f.confidence !== old) report.factsRefreshed++;
@@ -639,19 +748,26 @@ export class MemoryStore {
             'organization', 'skill', 'constraint',
         ]);
 
-        // 2a. Prune superseded facts on ALL entities (including protected)
-        //     These were explicitly replaced by newer facts via contradiction resolution
+        // 2a. Archive very old superseded facts (storage management only)
+        //     These are facts that were superseded a long time ago — retained for
+        //     learning history but eventually archived to manage storage.
+        const archiveCutoff = now - archiveDays * 24 * 60 * 60 * 1000;
         for (const entity of this.entities.values()) {
             const before = entity.facts.length;
-            entity.facts = entity.facts.filter(f => !f.content.startsWith('[SUPERSEDED'));
+            entity.facts = entity.facts.filter(f => {
+                if (f.status !== 'superseded') return true;
+                return (f.supersededAt || f.lastConfirmed) > archiveCutoff;
+            });
             report.factsPruned += before - entity.facts.length;
         }
 
-        // 2b. Prune stale low-confidence facts (only on non-protected entities)
+        // 2b. Prune stale low-confidence ACTIVE facts (only on non-protected entities)
+        //     Superseded facts are not touched here — they're retained for learning
         for (const entity of this.entities.values()) {
             if (PROTECTED_TYPES.has(entity.type)) continue;
             const before = entity.facts.length;
             entity.facts = entity.facts.filter(f => {
+                if (f.status === 'superseded') return true; // never prune superseded in this step
                 const ageDays = (now - f.lastConfirmed) / (1000 * 60 * 60 * 24);
                 // Keep if: high enough confidence, OR recently confirmed, OR has multiple sources
                 if (f.confidence >= staleConfThreshold) return true;
@@ -664,11 +780,13 @@ export class MemoryStore {
             report.factsPruned += before - entity.facts.length;
         }
 
-        // 3. Remove entities with no facts remaining (except self-entity)
+        // 3. Remove entities with no ACTIVE facts remaining (except self-entity)
+        //    An entity with only superseded facts is kept for history
         const emptyEntities: string[] = [];
         for (const [key, entity] of this.entities) {
             if (entity.type === 'agent-self') continue;
-            if (entity.facts.length === 0) emptyEntities.push(key);
+            const activeFacts = entity.facts.filter(f => f.status === 'active');
+            if (activeFacts.length === 0 && entity.facts.length === 0) emptyEntities.push(key);
         }
         for (const key of emptyEntities) {
             this.entities.delete(key);
