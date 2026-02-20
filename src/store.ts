@@ -166,7 +166,7 @@ function checkContradiction(existingFact: Fact, newFactStr: string): Contradicti
     // Skip very short facts (too vague to contradict)
     if (existing.length < 10 || incoming.length < 10) return null;
 
-    // Check for negation contradictions
+    // 1. Negation contradictions
     for (const pattern of NEGATION_PATTERNS) {
         if (pattern.test(incoming) && !pattern.test(existing)) {
             // Check they're about the same topic (word overlap > 40%)
@@ -184,7 +184,7 @@ function checkContradiction(existingFact: Fact, newFactStr: string): Contradicti
         }
     }
 
-    // Check for number/version conflicts
+    // 2. Number/version conflicts
     if (detectNumberConflict(existing, incoming)) {
         return {
             entity: '',
@@ -192,6 +192,38 @@ function checkContradiction(existingFact: Fact, newFactStr: string): Contradicti
             newFact: newFactStr,
             reason: 'Number/version conflict — same context but different values',
         };
+    }
+
+    // 3. High topic overlap with different content — two facts about the same subject
+    //    that say different things (e.g. "located at packages/agent/" vs "located at src/")
+    const sim = jaccardSimilarity(existing, incoming);
+    if (sim > 0.4 && sim < 0.95) {
+        // High overlap but not near-identical — likely contradictory update
+        // Extract key nouns/values (words with / or . or uppercase) to check for divergence
+        const extractKeys = (s: string): Set<string> => {
+            const keys = new Set<string>();
+            for (const w of s.split(/\s+/)) {
+                if (w.includes('/') || w.includes('.') || /^[A-Z]/.test(w) || w.match(/^\d/)) {
+                    keys.add(w.toLowerCase());
+                }
+            }
+            return keys;
+        };
+        const keysA = extractKeys(existingFact.content);
+        const keysB = extractKeys(newFactStr);
+        // If they share topic words but have divergent key values → contradiction
+        if (keysA.size > 0 && keysB.size > 0) {
+            let shared = 0, divergent = 0;
+            for (const k of keysB) { if (keysA.has(k)) shared++; else divergent++; }
+            if (divergent > 0 && shared >= 0) {
+                return {
+                    entity: '',
+                    existingFact: existingFact.content,
+                    newFact: newFactStr,
+                    reason: 'Same-topic update — high word overlap with different key values',
+                };
+            }
+        }
     }
 
     return null;
@@ -301,15 +333,23 @@ export class MemoryStore {
                     match.lastConfirmed = Date.now();
                     match.confidence = computeConfidence(match.sources, match.lastConfirmed);
                 } else {
-                    // Check for contradictions against existing facts before adding
+                    // Check for contradictions — supersede old facts when found
+                    const superseded: Fact[] = [];
                     for (const ef of existing.facts) {
                         const warning = checkContradiction(ef, f);
                         if (warning) {
                             warning.entity = name;
                             contradictions.push(warning);
+                            superseded.push(ef);
                         }
                     }
-                    // New fact — add regardless (contradictions are warnings, not blocks)
+                    // Supersede contradicted facts: drastically reduce confidence so they
+                    // get pruned during next consolidation, and mark them as superseded
+                    for (const old of superseded) {
+                        old.confidence = 0.05;
+                        old.content = `[SUPERSEDED by: ${f.slice(0, 80)}] ${old.content}`;
+                    }
+                    // Add the new (correct) fact
                     existing.facts.push(createFact(f));
                 }
             }
@@ -341,6 +381,52 @@ export class MemoryStore {
     }
 
     getAllEntities(): Entity[] { return Array.from(this.entities.values()); }
+
+    /**
+     * Remove a specific fact from an entity by substring match.
+     * Returns the number of facts removed.
+     */
+    removeFact(entityName: string, factSubstring: string): number {
+        const entity = this.entities.get(this.key(entityName));
+        if (!entity) return 0;
+        const lower = factSubstring.toLowerCase();
+        const before = entity.facts.length;
+        entity.facts = entity.facts.filter(f => !f.content.toLowerCase().includes(lower));
+        const removed = before - entity.facts.length;
+        if (removed > 0) this.dirty = true;
+        return removed;
+    }
+
+    /**
+     * Replace facts matching a substring with a new fact.
+     * Returns { removed: number, added: boolean }.
+     */
+    replaceFact(entityName: string, oldFactSubstring: string, newFact: string): { removed: number; added: boolean } {
+        const removed = this.removeFact(entityName, oldFactSubstring);
+        const entity = this.entities.get(this.key(entityName));
+        if (!entity) return { removed: 0, added: false };
+        entity.facts.push(createFact(newFact));
+        entity.lastSeen = Date.now();
+        this.dirty = true;
+        return { removed, added: true };
+    }
+
+    /**
+     * Clean up superseded facts from an entity (remove facts prefixed with [SUPERSEDED]).
+     */
+    pruneSuperseded(entityName?: string): number {
+        let pruned = 0;
+        const targets = entityName
+            ? [this.entities.get(this.key(entityName))].filter(Boolean) as Entity[]
+            : Array.from(this.entities.values());
+        for (const entity of targets) {
+            const before = entity.facts.length;
+            entity.facts = entity.facts.filter(f => !f.content.startsWith('[SUPERSEDED'));
+            pruned += before - entity.facts.length;
+        }
+        if (pruned > 0) this.dirty = true;
+        return pruned;
+    }
 
     // ── Relations ────────────────────────────────────
 
@@ -553,7 +639,15 @@ export class MemoryStore {
             'organization', 'skill', 'constraint',
         ]);
 
-        // 2. Prune stale low-confidence facts (only on non-protected entities)
+        // 2a. Prune superseded facts on ALL entities (including protected)
+        //     These were explicitly replaced by newer facts via contradiction resolution
+        for (const entity of this.entities.values()) {
+            const before = entity.facts.length;
+            entity.facts = entity.facts.filter(f => !f.content.startsWith('[SUPERSEDED'));
+            report.factsPruned += before - entity.facts.length;
+        }
+
+        // 2b. Prune stale low-confidence facts (only on non-protected entities)
         for (const entity of this.entities.values()) {
             if (PROTECTED_TYPES.has(entity.type)) continue;
             const before = entity.facts.length;

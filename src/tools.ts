@@ -49,14 +49,41 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Entities ─────────────────────────────────────
 
-    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph.', {
+    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph. Contradictory old facts are automatically superseded by new ones.', {
         name: z.string().describe('Entity name'),
         type: z.enum(['person', 'project', 'technology', 'preference', 'concept', 'file', 'service', 'organization', 'other']),
         facts: z.array(z.string()).describe('Facts about this entity'),
     }, async ({ name, type, facts }) => {
         const { entity: e, contradictions } = store.addEntity(name, type, facts);
+        // Immediately prune superseded facts so they don't linger
+        const pruned = store.pruneSuperseded(name);
         await store.flush();
-        return { content: [{ type: 'text' as const, text: `Entity "${e.name}" (${e.type}): ${e.facts.length} facts${formatContradictions(contradictions)}` }] };
+        let text = `Entity "${e.name}" (${e.type}): ${e.facts.length} facts`;
+        if (pruned > 0) text += ` (${pruned} old contradictory fact(s) replaced)`;
+        text += formatContradictions(contradictions);
+        return { content: [{ type: 'text' as const, text }] };
+    });
+
+    server.tool('update_entity', 'Replace a specific fact on an entity. Use when correcting wrong information. Finds facts containing oldFact substring and replaces with newFact.', {
+        name: z.string().describe('Entity name'),
+        oldFact: z.string().describe('Substring of the old/wrong fact to find and remove'),
+        newFact: z.string().describe('New correct fact to add'),
+    }, async ({ name, oldFact, newFact }) => {
+        const { removed, added } = store.replaceFact(name, oldFact, newFact);
+        await store.flush();
+        if (removed === 0 && !added) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
+        if (removed === 0) return { content: [{ type: 'text' as const, text: `No facts matching "${oldFact}" found on "${name}". Added new fact anyway.` }] };
+        return { content: [{ type: 'text' as const, text: `Updated "${name}": removed ${removed} old fact(s) matching "${oldFact}", added: "${newFact}"` }] };
+    });
+
+    server.tool('remove_fact', 'Remove specific facts from an entity by substring match. Use to clean up wrong or outdated information.', {
+        name: z.string().describe('Entity name'),
+        factSubstring: z.string().describe('Substring to match against facts — all matching facts will be removed'),
+    }, async ({ name, factSubstring }) => {
+        const removed = store.removeFact(name, factSubstring);
+        await store.flush();
+        if (removed === 0) return { content: [{ type: 'text' as const, text: `No facts matching "${factSubstring}" found on entity "${name}".` }] };
+        return { content: [{ type: 'text' as const, text: `Removed ${removed} fact(s) matching "${factSubstring}" from "${name}".` }] };
     });
 
     server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their facts.', {
