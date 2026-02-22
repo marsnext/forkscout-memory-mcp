@@ -19,7 +19,7 @@ function formatContradictions(warnings: ContradictionWarning[]): string {
 export function registerTools(server: McpServer, store: MemoryStore): void {
     // ── Knowledge ────────────────────────────────────
 
-    server.tool('save_knowledge', 'Save a fact or observation to long-term memory. Facts are stored in the knowledge graph and can be searched later.', {
+    server.tool('save_knowledge', 'Save a fact or observation to long-term memory. Facts are stored in the knowledge graph and can be searched later. RULE: You MUST call search_knowledge or search_entities before using this tool. If a similar fact exists, update the existing entity with update_entity or add_entity instead of creating a new entry.', {
         fact: z.string().describe('Fact to store. Be specific and self-contained.'),
         category: z.string().optional().describe('Category: user-preference, project-context, decision, etc.'),
         project: z.string().optional().describe('Project name this fact belongs to (e.g. "forkscout"). Omit for universal knowledge.'),
@@ -57,7 +57,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Entities ─────────────────────────────────────
 
-    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph. Contradictory old facts are automatically superseded (marked as historical) by new ones — they are retained for learning, not deleted.', {
+    server.tool('add_entity', 'Add or update a named entity (person, project, technology, etc.) with associated facts in the knowledge graph. If an entity with this name already exists, new facts are merged into it and contradictory old facts are automatically superseded (retained as history). RULE: You MUST call search_entities before using this tool. If a matching entity exists, use the SAME name to merge facts into it.', {
         name: z.string().describe('Entity name'),
         type: z.enum(['person', 'project', 'technology', 'preference', 'concept', 'file', 'service', 'organization', 'other']),
         facts: z.array(z.string()).describe('Facts about this entity'),
@@ -220,7 +220,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
 
     // ── Agent internal tools (exchange tracking, relations, self-identity) ──
 
-    server.tool('add_exchange', 'Record a user/assistant conversation exchange for later recall and context building.', {
+    server.tool('add_exchange', 'Record a user/assistant conversation exchange for later recall and context building. RULE: Only record exchanges with non-obvious root causes or significant decisions. You MUST call search_exchanges first to avoid recording a duplicate for the same topic/session.', {
         user: z.string().describe('User message text'),
         assistant: z.string().describe('Assistant response text'),
         sessionId: z.string().describe('Session identifier'),
@@ -244,7 +244,7 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: JSON.stringify(hits) }] };
     });
 
-    server.tool('add_relation', 'Create a typed relationship between two entities in the knowledge graph (e.g. "Alice uses TypeScript").', {
+    server.tool('add_relation', 'Create a typed relationship between two entities in the knowledge graph (e.g. "Alice uses TypeScript"). Duplicate relations auto-merge (weight increases). RULE: You MUST call search_entities on both entity names first to ensure you are linking the correct existing entities.', {
         from: z.string().describe('Source entity name'),
         to: z.string().describe('Target entity name'),
         type: z.enum(RELATION_TYPES).describe('Relation type'),
