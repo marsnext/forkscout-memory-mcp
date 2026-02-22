@@ -22,25 +22,33 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     server.tool('save_knowledge', 'Save a fact or observation to long-term memory. Facts are stored in the knowledge graph and can be searched later.', {
         fact: z.string().describe('Fact to store. Be specific and self-contained.'),
         category: z.string().optional().describe('Category: user-preference, project-context, decision, etc.'),
-    }, async ({ fact, category }) => {
+        project: z.string().optional().describe('Project name this fact belongs to (e.g. "forkscout"). Omit for universal knowledge.'),
+        scope: z.enum(['project', 'universal']).optional().describe('Scope: "project" for project-specific, "universal" for cross-project knowledge. Default: inferred from project param.'),
+    }, async ({ fact, category, project, scope }) => {
         const tagged = category ? `[${category}] ${fact}` : fact;
+        const tags: Record<string, string> = {};
+        if (project) tags.project = project;
+        if (scope) tags.scope = scope;
+        else if (!project) tags.scope = 'universal'; // no project → universal by default
         const hits = store.searchEntities(fact, 1);
         let contradictions: ContradictionWarning[] = [];
         if (hits.length > 0) {
-            const result = store.addEntity(hits[0].name, hits[0].type, [tagged]);
+            const result = store.addEntity(hits[0].name, hits[0].type, [tagged], Object.keys(tags).length > 0 ? tags : undefined);
             contradictions = result.contradictions;
         } else {
-            store.addEntity(category || 'knowledge', 'concept', [tagged]);
+            store.addEntity(category || 'knowledge', 'concept', [tagged], Object.keys(tags).length > 0 ? tags : undefined);
         }
         await store.flush();
         return { content: [{ type: 'text' as const, text: `Saved: ${fact}${formatContradictions(contradictions)}` }] };
     });
 
-    server.tool('search_knowledge', 'Search long-term memory for facts, entities, and past conversations. Returns ranked results by relevance.', {
+    server.tool('search_knowledge', 'Search long-term memory for facts, entities, and past conversations. Returns ranked results by relevance. Supports project-scoped filtering.', {
         query: z.string().describe('Natural language search query.'),
         limit: z.number().optional().describe('Max results (default: 5).'),
-    }, async ({ query, limit }) => {
-        const results = store.searchKnowledge(query, limit || 5);
+        project: z.string().optional().describe('Filter by project name. Returns project-specific + universal results.'),
+    }, async ({ query, limit, project }) => {
+        const filter = project ? { project } : undefined;
+        const results = store.searchKnowledge(query, limit || 5, filter);
         const text = results.length === 0
             ? 'No relevant memories found.'
             : results.map((r, i) => `${i + 1}. [${r.relevance}%, ${r.source}] ${r.content}`).join('\n');
@@ -53,8 +61,9 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         name: z.string().describe('Entity name'),
         type: z.enum(['person', 'project', 'technology', 'preference', 'concept', 'file', 'service', 'organization', 'other']),
         facts: z.array(z.string()).describe('Facts about this entity'),
-    }, async ({ name, type, facts }) => {
-        const { entity: e, contradictions } = store.addEntity(name, type, facts);
+        tags: z.record(z.string()).optional().describe('Tags for scoped search (e.g. { project: "forkscout", scope: "universal" })'),
+    }, async ({ name, type, facts, tags }) => {
+        const { entity: e, contradictions } = store.addEntity(name, type, facts, tags);
         await store.flush();
         const activeFacts = e.facts.filter(f => f.status === 'active').length;
         const supersededFacts = e.facts.filter(f => f.status === 'superseded').length;
@@ -87,11 +96,13 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: `Superseded ${superseded} fact(s) matching "${factSubstring}" from "${name}" (retained as history).` }] };
     });
 
-    server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their active (current) facts.', {
+    server.tool('search_entities', 'Search for entities in the knowledge graph by name or content. Returns matching entities with their active (current) facts. Supports project-scoped filtering.', {
         query: z.string().describe('Search query'),
         limit: z.number().optional().describe('Max results (default: 5)'),
-    }, async ({ query, limit }) => {
-        const hits = store.searchEntities(query, limit || 5);
+        project: z.string().optional().describe('Filter by project name. Returns project-specific + universal results.'),
+    }, async ({ query, limit, project }) => {
+        const filter = project ? { project } : undefined;
+        const hits = store.searchEntities(query, limit || 5, filter);
         const text = hits.length === 0
             ? 'No matching entities.'
             : hits.map(e => {
@@ -208,17 +219,21 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         assistant: z.string().describe('Assistant response text'),
         sessionId: z.string().describe('Session identifier'),
         importance: z.number().min(0).max(1).optional().describe('Importance score 0-1 (default: auto). Higher = more likely to surface in search.'),
-    }, async ({ user, assistant, sessionId, importance }) => {
-        store.addExchange(user, assistant, sessionId, importance);
+        project: z.string().optional().describe('Project name this exchange belongs to.'),
+    }, async ({ user, assistant, sessionId, importance, project }) => {
+        const tags = project ? { project } : undefined;
+        store.addExchange(user, assistant, sessionId, importance, tags);
         await store.flush();
         return { content: [{ type: 'text' as const, text: `Exchange recorded${importance !== undefined ? ` (importance: ${Math.round(importance * 100)}%)` : ''}.` }] };
     });
 
-    server.tool('search_exchanges', 'Search past conversation exchanges by content. Returns matching user/assistant message pairs.', {
+    server.tool('search_exchanges', 'Search past conversation exchanges by content. Returns matching user/assistant message pairs. Supports project-scoped filtering.', {
         query: z.string().describe('Search query'),
         limit: z.number().optional().describe('Max results (default: 5)'),
-    }, async ({ query, limit }) => {
-        const hits = store.searchExchanges(query, limit || 5);
+        project: z.string().optional().describe('Filter by project name. Returns project-specific + universal results.'),
+    }, async ({ query, limit, project }) => {
+        const filter = project ? { project } : undefined;
+        const hits = store.searchExchanges(query, limit || 5, filter);
         if (hits.length === 0) return { content: [{ type: 'text' as const, text: '[]' }] };
         return { content: [{ type: 'text' as const, text: JSON.stringify(hits) }] };
     });

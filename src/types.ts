@@ -110,6 +110,8 @@ export interface Entity {
     facts: Fact[];
     lastSeen: number;
     accessCount: number;
+    /** Multi-dimensional tags for scoped search (e.g. { project: "forkscout", scope: "universal" }). */
+    tags?: Record<string, string>;
 }
 
 export interface Relation {
@@ -133,6 +135,8 @@ export interface Exchange {
     sessionId: string;
     /** 0–1 significance score. Higher = more impactful conversation. */
     importance?: number;
+    /** Multi-dimensional tags for scoped search (e.g. { project: "forkscout" }). */
+    tags?: Record<string, string>;
 }
 
 export type TaskStatus = 'running' | 'paused' | 'completed' | 'aborted';
@@ -156,10 +160,19 @@ export interface ActiveTask {
 export const TASK_MAX_DURATION_MS = 2 * 60 * 60 * 1000;
 
 export interface MemoryData {
-    version: 6;
+    version: 7;
     entities: Entity[];
     relations: Relation[];
     exchanges: Exchange[];
+    activeTasks: ActiveTask[];
+}
+
+/** V6 shapes for migration (no tags field on entities/exchanges). */
+export interface LegacyMemoryDataV6 {
+    version: 6;
+    entities: Array<{ name: string; type: EntityType; facts: Fact[]; lastSeen: number; accessCount: number }>;
+    relations: Relation[];
+    exchanges: Array<{ id: string; user: string; assistant: string; timestamp: number; sessionId: string; importance?: number }>;
     activeTasks: ActiveTask[];
 }
 

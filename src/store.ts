@@ -5,7 +5,7 @@
 
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
-import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5 } from './types.js';
+import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5, LegacyMemoryDataV6 } from './types.js';
 import { SELF_ENTITY_NAME } from './types.js';
 import { TaskManager } from './tasks.js';
 
@@ -318,13 +318,27 @@ export class MemoryStore {
                 const supersededCount = Array.from(this.entities.values())
                     .reduce((sum, e) => sum + e.facts.filter(f => f.status === 'superseded').length, 0);
                 console.log(`✅ Migrated ${this.entities.size} entities (${supersededCount} superseded facts preserved as history)`);
-            } else {
-                // Already v6
-                const v6 = data as MemoryData;
-                for (const e of v6.entities) this.entities.set(this.key(e.name), e);
+            } else if (data.version === 6) {
+                // ── v6 → v7 migration (add tags field to entities/exchanges) ──
+                console.log('🔄 Migrating memory v6 → v7 (multi-dimensional tags)...');
+                const v6 = data as LegacyMemoryDataV6;
+                for (const e of v6.entities) {
+                    const migrated: Entity = { ...e };
+                    // Existing entities get no tags (backwards compatible — untagged passes all filters)
+                    this.entities.set(this.key(e.name), migrated);
+                }
                 this.relations = v6.relations || [];
-                this.exchanges = v6.exchanges || [];
+                this.exchanges = (v6.exchanges || []).map(ex => ({ ...ex } as Exchange));
                 this.tasks.load(v6.activeTasks || []);
+                this.dirty = true;
+                console.log(`✅ Migrated ${this.entities.size} entities to v7 (tags-ready)`);
+            } else {
+                // Already v7
+                const v7 = data as MemoryData;
+                for (const e of v7.entities) this.entities.set(this.key(e.name), e);
+                this.relations = v7.relations || [];
+                this.exchanges = v7.exchanges || [];
+                this.tasks.load(v7.activeTasks || []);
             }
         } catch { /* start fresh */ }
         this.ensureSelfEntity();
@@ -344,7 +358,7 @@ export class MemoryStore {
         try {
             await mkdir(dirname(this.filePath), { recursive: true });
             const data: MemoryData = {
-                version: 6,
+                version: 7,
                 entities: Array.from(this.entities.values()),
                 relations: this.relations,
                 exchanges: this.exchanges.slice(-500),
@@ -366,12 +380,14 @@ export class MemoryStore {
 
     // ── Entity CRUD ──────────────────────────────────
 
-    addEntity(name: string, type: EntityType, facts: string[]): { entity: Entity; contradictions: ContradictionWarning[] } {
+    addEntity(name: string, type: EntityType, facts: string[], tags?: Record<string, string>): { entity: Entity; contradictions: ContradictionWarning[] } {
         const k = this.key(name);
         const existing = this.entities.get(k);
         const contradictions: ContradictionWarning[] = [];
 
         if (existing) {
+            // Merge tags if provided (new tags override existing per-key)
+            if (tags) existing.tags = { ...existing.tags, ...tags };
             for (const f of facts) {
                 const match = existing.facts.find(ef =>
                     ef.status === 'active' && ef.content.toLowerCase() === f.toLowerCase());
@@ -413,6 +429,7 @@ export class MemoryStore {
             name, type,
             facts: facts.map(f => createFact(f)),
             lastSeen: Date.now(), accessCount: 1,
+            ...(tags && Object.keys(tags).length > 0 ? { tags } : {}),
         };
         this.entities.set(k, entity);
         this.dirty = true;
@@ -555,7 +572,7 @@ export class MemoryStore {
 
     // ── Exchanges ────────────────────────────────────
 
-    addExchange(user: string, assistant: string, sessionId: string, importance?: number): Exchange {
+    addExchange(user: string, assistant: string, sessionId: string, importance?: number, tags?: Record<string, string>): Exchange {
         const ex: Exchange = {
             id: `ex_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             user: user.slice(0, 2000),
@@ -563,6 +580,7 @@ export class MemoryStore {
             timestamp: Date.now(),
             sessionId,
             importance,
+            ...(tags && Object.keys(tags).length > 0 ? { tags } : {}),
         };
         this.exchanges.push(ex);
         this.dirty = true;
@@ -573,11 +591,19 @@ export class MemoryStore {
 
     // ── Search ───────────────────────────────────────
 
-    searchEntities(query: string, limit = 5): Entity[] {
+    /**
+     * Search entities with optional tag-based filtering.
+     * When filter.project is set, returns BOTH project-specific matches AND
+     * entities tagged scope:"universal" (or untagged) — merged by relevance.
+     */
+    searchEntities(query: string, limit = 5, filter?: Record<string, string>): Entity[] {
         const q = query.toLowerCase();
         const terms = q.split(/\s+/).filter(Boolean);
         const scored: Array<{ entity: Entity; score: number }> = [];
         for (const entity of this.entities.values()) {
+            // Tag-based pre-filter: skip entities that don't match the filter
+            if (filter && !this.matchesFilter(entity.tags, filter)) continue;
+
             let score = 0;
             const nameL = entity.name.toLowerCase();
             if (nameL === q) score += 10;
@@ -614,10 +640,13 @@ export class MemoryStore {
         return results;
     }
 
-    searchExchanges(query: string, limit = 5): Exchange[] {
+    searchExchanges(query: string, limit = 5, filter?: Record<string, string>): Exchange[] {
         const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
         const scored: Array<{ ex: Exchange; score: number }> = [];
         for (const ex of this.exchanges) {
+            // Tag-based pre-filter
+            if (filter && !this.matchesFilter(ex.tags, filter)) continue;
+
             let score = 0;
             const text = `${ex.user} ${ex.assistant}`.toLowerCase();
             for (const t of terms) { if (text.includes(t)) score += 1; }
@@ -631,9 +660,9 @@ export class MemoryStore {
         return scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.ex);
     }
 
-    searchKnowledge(query: string, limit = 5): SearchResult[] {
+    searchKnowledge(query: string, limit = 5, filter?: Record<string, string>): SearchResult[] {
         const results: SearchResult[] = [];
-        for (const e of this.searchEntities(query, limit)) {
+        for (const e of this.searchEntities(query, limit, filter)) {
             // Show top ACTIVE facts by confidence
             const topFacts = [...e.facts]
                 .filter(f => f.status === 'active')
@@ -650,7 +679,7 @@ export class MemoryStore {
                 relevance: avgConf,
             });
         }
-        for (const ex of this.searchExchanges(query, limit)) {
+        for (const ex of this.searchExchanges(query, limit, filter)) {
             const imp = ex.importance ? Math.round(ex.importance * 100) : 70;
             results.push({
                 content: `User: ${ex.user.slice(0, 200)} → Assistant: ${ex.assistant.slice(0, 200)}`,
@@ -691,6 +720,33 @@ export class MemoryStore {
     get exchangeCount(): number { return this.exchanges.length; }
 
     private key(name: string): string { return name.toLowerCase().trim(); }
+
+    /**
+     * Check if an item's tags match a filter.
+     * Smart scoping rules:
+     * - If filter has `project`, matches items with that project tag OR items with scope:"universal" OR untagged items.
+     * - For all other filter keys, requires exact match.
+     * - Items with no tags pass non-project filters (backwards compatible).
+     */
+    private matchesFilter(itemTags: Record<string, string> | undefined, filter: Record<string, string>): boolean {
+        for (const [key, value] of Object.entries(filter)) {
+            if (key === 'project') {
+                // Smart project scoping: include project-specific + universal + untagged
+                if (!itemTags) continue; // untagged items always pass project filter
+                const itemProject = itemTags.project;
+                const itemScope = itemTags.scope;
+                if (!itemProject && !itemScope) continue; // no project/scope tags = passes
+                if (itemScope === 'universal') continue;  // universal items always pass
+                if (itemProject && itemProject.toLowerCase() !== value.toLowerCase()) return false;
+            } else {
+                // Exact match for other keys — untagged items pass (backwards compatible)
+                if (!itemTags) continue;
+                const itemVal = itemTags[key];
+                if (itemVal && itemVal.toLowerCase() !== value.toLowerCase()) return false;
+            }
+        }
+        return true;
+    }
 
     /** Refresh confidence scores on all ACTIVE facts (call periodically or on read). */
     refreshConfidence(): void {
