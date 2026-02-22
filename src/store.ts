@@ -690,11 +690,101 @@ export class MemoryStore {
         return results.sort((a, b) => b.relevance - a.relevance).slice(0, limit);
     }
 
+    // ── Fact filtering ────────────────────────────────
+
+    /**
+     * Score and filter active facts by relevance to a query.
+     * Returns facts sorted by score (descending), limited to `limit`.
+     * Each fact gets a score based on:
+     *   - Term overlap with query (keyword matching)
+     *   - Confidence (high-confidence facts rank higher)
+     *   - Recency bonus (recently confirmed facts get a boost)
+     *   - Category tag bonus (facts whose [tag] matches query terms)
+     */
+    private scoreFactsForQuery(facts: Fact[], query: string, limit: number): Fact[] {
+        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        if (terms.length === 0) {
+            // No query — return top facts by confidence + recency
+            return [...facts]
+                .filter(f => f.status === 'active')
+                .sort((a, b) => b.confidence - a.confidence)
+                .slice(0, limit);
+        }
+
+        const scored: Array<{ fact: Fact; score: number }> = [];
+        for (const f of facts) {
+            if (f.status !== 'active') continue;
+            const contentL = f.content.toLowerCase();
+            let score = 0;
+
+            // Term matching: each query term found in fact content adds score
+            for (const t of terms) {
+                if (contentL.includes(t)) score += 1;
+            }
+
+            // Category tag matching: [architecture], [debugging], [user-preference] etc.
+            const tagMatch = f.content.match(/^\[([\w-]+)\]/);
+            if (tagMatch) {
+                const tag = tagMatch[1].toLowerCase();
+                for (const t of terms) {
+                    if (tag.includes(t) || t.includes(tag)) score += 2;
+                }
+            }
+
+            // Confidence boost: high-confidence facts rank higher
+            score += f.confidence * 0.5;
+
+            // Recency boost: recently confirmed facts get a small bump
+            const ageDays = (Date.now() - f.lastConfirmed) / (1000 * 60 * 60 * 24);
+            score += Math.exp(-ageDays / 30) * 0.3;
+
+            // Source reinforcement: multi-confirmed facts rank higher
+            if (f.sources >= 2) score += 0.2;
+
+            if (score > 0) scored.push({ fact: f, score });
+        }
+
+        return scored
+            .sort((a, b) => b.score - a.score)
+            .slice(0, limit)
+            .map(s => s.fact);
+    }
+
+    /**
+     * Get an entity with optionally filtered facts.
+     * If query is provided, only returns facts relevant to the query (capped at limit).
+     * If no query, returns all active facts (or capped at limit if specified).
+     */
+    getFilteredEntity(name: string, query?: string, limit?: number): (Entity & { _totalActiveFacts?: number }) | undefined {
+        const entity = this.entities.get(this.key(name));
+        if (!entity) return undefined;
+
+        const activeFacts = entity.facts.filter(f => f.status === 'active');
+        const effectiveLimit = limit ?? (query ? 30 : activeFacts.length);
+
+        if (!query && !limit) {
+            // No filtering — return full entity
+            return entity;
+        }
+
+        const filteredFacts = query
+            ? this.scoreFactsForQuery(entity.facts, query, effectiveLimit)
+            : activeFacts.sort((a, b) => b.confidence - a.confidence).slice(0, effectiveLimit);
+
+        return {
+            ...entity,
+            facts: filteredFacts,
+            _totalActiveFacts: activeFacts.length,
+        };
+    }
+
     // ── Self-entity ──────────────────────────────────
 
-    getSelfEntity(): Entity {
+    getSelfEntity(query?: string, limit?: number): Entity & { _totalActiveFacts?: number } {
         this.ensureSelfEntity();
-        return this.entities.get(this.key(SELF_ENTITY_NAME))!;
+        const full = this.entities.get(this.key(SELF_ENTITY_NAME))!;
+        if (!query && !limit) return full;
+        return this.getFilteredEntity(SELF_ENTITY_NAME, query, limit) ?? full;
     }
 
     addSelfObservation(content: string): void {

@@ -116,19 +116,25 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text }] };
     });
 
-    server.tool('get_entity', 'Get a specific entity by exact name. Shows active (current) facts by default. Use get_fact_history to see how beliefs evolved.', {
+    server.tool('get_entity', 'Get a specific entity by exact name. Supports context-filtered retrieval — pass a query to get only relevant facts instead of all facts. Use get_fact_history to see how beliefs evolved.', {
         name: z.string().describe('Entity name to look up'),
+        query: z.string().optional().describe('Filter facts by relevance to this query/context. Only matching facts returned.'),
+        limit: z.number().optional().describe('Max facts to return (default: all if no query, 30 if query provided)'),
         includeHistory: z.boolean().optional().describe('Include superseded (historical) facts (default: false)'),
-    }, async ({ name, includeHistory }) => {
-        const e = store.getEntity(name);
+    }, async ({ name, query, limit, includeHistory }) => {
+        const e = store.getFilteredEntity(name, query, limit);
         if (!e) return { content: [{ type: 'text' as const, text: `Entity "${name}" not found.` }] };
         const activeFacts = e.facts.filter(f => f.status === 'active');
         const supersededFacts = e.facts.filter(f => f.status === 'superseded');
+        const totalActive = (e as any)._totalActiveFacts ?? activeFacts.length;
         const activeLines = [...activeFacts]
             .sort((a, b) => b.confidence - a.confidence)
             .map(f => `  • [${Math.round(f.confidence * 100)}%] ${f.content} (${f.sources}x confirmed)`)
             .join('\n');
-        let text = `${e.name} (${e.type}, seen ${e.accessCount}x, ${activeFacts.length} active, ${supersededFacts.length} historical):\n${activeLines}`;
+        const filterNote = (query || limit) && totalActive > activeFacts.length
+            ? ` [showing ${activeFacts.length}/${totalActive} facts${query ? ` matching "${query.slice(0, 50)}"` : ''}]`
+            : '';
+        let text = `${e.name} (${e.type}, seen ${e.accessCount}x, ${activeFacts.length} active, ${supersededFacts.length} historical)${filterNote}:\n${activeLines}`;
         if (includeHistory && supersededFacts.length > 0) {
             const historyLines = [...supersededFacts]
                 .sort((a, b) => (b.supersededAt || 0) - (a.supersededAt || 0))
@@ -264,8 +270,24 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
         return { content: [{ type: 'text' as const, text: JSON.stringify(store.getAllRelations()) }] };
     });
 
-    server.tool('get_self_entity', 'Get the agent\'s own identity entity with all learned facts and self-observations.', {}, async () => {
-        const self = store.getSelfEntity();
+    server.tool('get_self_entity', 'Get the agent\'s own identity entity. Pass a query to get only facts relevant to the current context instead of ALL facts (which can be 30K+ tokens). Always pass a query in normal usage.', {
+        query: z.string().optional().describe('Filter self-facts by relevance to this context/topic. Dramatically reduces token usage.'),
+        limit: z.number().optional().describe('Max facts to return (default: 30 when query provided, all when no query)'),
+    }, async ({ query, limit }) => {
+        const self = store.getSelfEntity(query, limit);
+        const totalActive = (self as any)._totalActiveFacts;
+        const activeFacts = self.facts.filter(f => f.status === 'active');
+        if (query || limit) {
+            // Filtered mode — return structured text (much smaller than full JSON)
+            const lines = activeFacts
+                .map(f => `• [${Math.round(f.confidence * 100)}%] ${f.content}`)
+                .join('\n');
+            const header = totalActive && totalActive > activeFacts.length
+                ? `Identity (${activeFacts.length}/${totalActive} facts matching "${(query || '').slice(0, 50)}"):`
+                : `Identity (${activeFacts.length} facts):`;
+            return { content: [{ type: 'text' as const, text: `${header}\n${lines}` }] };
+        }
+        // Unfiltered mode — return full JSON (backwards compatible)
         return { content: [{ type: 'text' as const, text: JSON.stringify(self) }] };
     });
 
