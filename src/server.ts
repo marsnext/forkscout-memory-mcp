@@ -28,6 +28,7 @@ const PORT = parseInt(process.env.MEMORY_PORT || '3211', 10);
 const HOST = process.env.MEMORY_HOST || '0.0.0.0';
 const STORAGE_DIR = process.env.MEMORY_STORAGE || resolve(process.cwd(), '.forkscout');
 const OWNER = process.env.MEMORY_OWNER || 'Admin';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
 /** Full consolidation interval: default 24 hours (light consolidation runs on every flush). */
 const CONSOLIDATION_INTERVAL_MS = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || String(24 * 60 * 60 * 1000), 10);
@@ -97,7 +98,7 @@ async function main() {
 
     // ── HTTP server ──────────────────────────────────
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Session-Id');
         res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
@@ -114,6 +115,8 @@ async function main() {
                 entities: store.entityCount,
                 relations: store.relationCount,
                 exchanges: store.exchangeCount,
+                exchangesHot: store.hotExchangeCount,
+                exchangesArchived: store.archiveExchangeCount,
                 activeTasks: store.tasks.runningCount,
                 consolidation: {
                     fullIntervalHours: Math.round(CONSOLIDATION_INTERVAL_MS / 3600000),
@@ -126,9 +129,9 @@ async function main() {
 
         // MCP endpoint — stateless: fresh transport per request
         if (url.startsWith('/mcp')) {
+            const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            const mcp = createMcpServer(store);
             try {
-                const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-                const mcp = createMcpServer(store);
                 await mcp.connect(transport);
 
                 let parsedBody: unknown;
@@ -138,13 +141,14 @@ async function main() {
                     parsedBody = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
                 }
                 await transport.handleRequest(req, res, parsedBody);
-                await mcp.close();
             } catch (err) {
                 console.error('MCP error:', err);
                 if (!res.headersSent) {
                     res.writeHead(500, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ error: 'MCP server error' }));
                 }
+            } finally {
+                await mcp.close();
             }
             return;
         }
@@ -158,7 +162,7 @@ async function main() {
         console.log(`   MCP:      http://${HOST}:${PORT}/mcp`);
         console.log(`   Health:   http://${HOST}:${PORT}/health`);
         console.log(`   Storage:  ${STORAGE_DIR}/memory.json`);
-        console.log(`   Entities: ${store.entityCount}, Relations: ${store.relationCount}, Exchanges: ${store.exchangeCount}`);
+        console.log(`   Entities: ${store.entityCount}, Relations: ${store.relationCount}, Exchanges: ${store.hotExchangeCount} hot + ${store.archiveExchangeCount} archived`);
         console.log(`\n   VS Code:  "mcp": { "servers": { "forkscout-memory": { "type": "http", "url": "http://localhost:${PORT}/mcp" } } }\n`);
     });
 

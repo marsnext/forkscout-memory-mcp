@@ -1,31 +1,33 @@
 services:
-    memory:
-        image: ghcr.io/martianacademy/forkscout-memory-mcp:latest
-        container_name: forkscout-memory
-        ports:
-            - '3211:3211'
-        volumes:
-            - memory-data:/data
-        environment:
-            - PORT=3211
-            - DATA_DIR=/data
-            - OWNER_NAME=Suru
-        restart: unless-stopped
-        networks:
-            - default
-            - forkscout
-        healthcheck:
-            test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3211/health']
-            interval: 30s
-            timeout: 5s
-            retries: 3
-            start_period: 10s
+  memory:
+    build: .
+    image: forkscout-memory-mcp:local
+    container_name: forkscout-memory
+    ports:
+      - "3211:3211"
+    volumes:
+      - memory-data:/data
+    environment:
+      - MEMORY_PORT=3211
+      - MEMORY_STORAGE=/data
+      - MEMORY_OWNER=Suru
+      - VERIFY_FILES=false
+    restart: unless-stopped
+    networks:
+      - default
+      - forkscout
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3211/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
-    memory-data:
-        external: true
+  memory-data:
+    external: true
 
 networks:
-    forkscout:
-        external: true
-        name: forkscout_default
+  forkscout:
+    external: true
+    name: forkscout_default

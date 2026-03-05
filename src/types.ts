@@ -201,3 +201,32 @@ export interface SearchResult {
 }
 
 export const SELF_ENTITY_NAME = process.env.SELF_ENTITY_NAME || 'Forkscout Agent';
+
+// ── Working memory (session-scoped, not persisted to disk) ───────────────────
+
+/** A single event in the agent's short-term context window. */
+export interface WorkingMemoryEvent {
+    /** What kind of event this is. */
+    type: 'action' | 'observation' | 'decision' | 'error' | 'fact';
+    content: string;
+    timestamp: number;
+    sessionId: string;
+}
+
+// ── Knowledge gaps (volatile facts that may be outdated) ─────────────────────
+
+/**
+ * A fact that is known to be volatile (port numbers, versions, file paths, env vars)
+ * and has not been verified recently. Surfaced by getKnowledgeGaps().
+ */
+export interface KnowledgeGap {
+    entityName: string;
+    factContent: string;
+    /** Always 'volatile' — only volatile facts produce gaps. */
+    volatility: 'volatile';
+    /** Timestamp of last confirmation (ms since epoch). */
+    lastVerified: number;
+    /** Human hint on how to re-verify (e.g. "Check package.json for version"). */
+    verificationHint: string;
+}
+

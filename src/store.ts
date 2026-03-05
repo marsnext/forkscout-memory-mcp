@@ -3,9 +3,10 @@
  * Supports v4→v5 migration (structured facts, weighted relations, exchange importance).
  */
 
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, rename, copyFile, appendFile, mkdir, access } from 'fs/promises';
 import { dirname } from 'path';
-import type { Entity, EntityType, Exchange, Fact, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5, LegacyMemoryDataV6 } from './types.js';
+import { WorkingMemoryManager } from './working-memory.js';
+import type { Entity, EntityType, Exchange, Fact, KnowledgeGap, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5, LegacyMemoryDataV6 } from './types.js';
 import { SELF_ENTITY_NAME } from './types.js';
 import { TaskManager } from './tasks.js';
 
@@ -90,7 +91,7 @@ function migrateFactV5toV6(f: { content: string; confidence: number; sources: nu
     }
     return {
         content,
-        confidence: isSuperseded ? f.confidence : f.confidence,
+        confidence: f.confidence,
         sources: f.sources,
         firstSeen: f.firstSeen,
         lastConfirmed: f.lastConfirmed,
@@ -144,6 +145,113 @@ function jaccardSimilarity(a: string, b: string): number {
     for (const x of setA) { if (setB.has(x)) intersection++; }
     const union = setA.size + setB.size - intersection;
     return union === 0 ? 0 : intersection / union;
+}
+
+// ── BM25 scoring ────────────────────────────────────────
+
+/**
+ * BM25-inspired term-frequency scoring with length normalisation.
+ * Significantly better than raw keyword counting for longer fact texts.
+ * k1=1.5 (TF saturation), b=0.75 (length normalisation).
+ */
+function bm25Score(terms: string[], docText: string, avgDocLen: number): number {
+    const K1 = 1.5, B = 0.75;
+    const words = docText.toLowerCase().split(/\s+/);
+    const docLen = words.length;
+    let score = 0;
+    for (const term of terms) {
+        let tf = 0;
+        for (const w of words) { if (w.includes(term)) tf++; }
+        if (tf === 0) continue;
+        // BM25 TF component with length normalisation
+        score += (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * (docLen / Math.max(avgDocLen, 1))));
+    }
+    return score;
+}
+
+// ── Semantic enhancement (synonym expansion + stemming) ─────────────────────
+
+/** Synonym groups for common programming / agent-memory domain terms. */
+const SYNONYM_GROUPS: string[][] = [
+    ['bug', 'error', 'issue', 'problem', 'defect', 'fault', 'fail', 'failure', 'exception', 'crash'],
+    ['fix', 'resolve', 'patch', 'repair', 'correct', 'debug', 'solve'],
+    ['implement', 'add', 'create', 'build', 'make', 'write', 'develop'],
+    ['remove', 'delete', 'drop', 'clean', 'purge', 'eliminate'],
+    ['update', 'upgrade', 'change', 'modify', 'edit', 'refactor'],
+    ['test', 'verify', 'check', 'validate', 'assert', 'ensure'],
+    ['deploy', 'ship', 'release', 'publish', 'launch'],
+    ['config', 'configuration', 'setting', 'option', 'param', 'parameter'],
+    ['auth', 'authentication', 'login', 'session', 'token'],
+    ['db', 'database', 'storage', 'store', 'persist', 'persistence'],
+    ['api', 'endpoint', 'route', 'handler', 'request', 'response'],
+    ['agent', 'bot', 'assistant', 'model', 'llm', 'ai'],
+    ['slow', 'performance', 'latency', 'optimize', 'fast', 'speed'],
+    ['search', 'find', 'query', 'lookup', 'retrieve', 'fetch'],
+    ['memory', 'context', 'recall', 'remember', 'cache'],
+    ['task', 'job', 'work', 'step', 'action', 'operation'],
+    ['log', 'print', 'output', 'trace', 'debug', 'console'],
+    ['type', 'kind', 'category', 'class', 'interface'],
+];
+
+// Reverse-lookup: word → synonym group index
+const SYNONYM_MAP = new Map<string, number>();
+for (let i = 0; i < SYNONYM_GROUPS.length; i++) {
+    for (const word of SYNONYM_GROUPS[i]) SYNONYM_MAP.set(word, i);
+}
+
+/** Lightweight suffix-stripping stemmer — faster + no deps vs full Porter. */
+function stem(word: string): string {
+    if (word.length < 5) return word;
+    if (word.endsWith('tions')) return word.slice(0, -5);
+    if (word.endsWith('tion')) return word.slice(0, -4);
+    if (word.endsWith('ness')) return word.slice(0, -4);
+    if (word.endsWith('ing') && word.length > 6) return word.slice(0, -3);
+    if (word.endsWith('ies') && word.length > 5) return word.slice(0, -3) + 'y';
+    if (word.endsWith('ed') && word.length > 5) return word.slice(0, -2);
+    if (word.endsWith('er') && word.length > 5) return word.slice(0, -2);
+    if (word.endsWith('ly') && word.length > 5) return word.slice(0, -2);
+    if (word.endsWith('s') && word.length > 4 && !word.endsWith('ss')) return word.slice(0, -1);
+    return word;
+}
+
+/**
+ * Expand query terms with their stems and synonym-group siblings.
+ * A query for "fixing bugs" will also match "resolve", "defect", "patch", etc.
+ */
+function expandTerms(terms: string[]): string[] {
+    const expanded = new Set<string>();
+    for (const t of terms) {
+        expanded.add(t);
+        const s = stem(t);
+        expanded.add(s);
+        // synonym lookup on both raw and stemmed form
+        const grpIdx = SYNONYM_MAP.get(t) ?? SYNONYM_MAP.get(s);
+        if (grpIdx !== undefined) {
+            for (const syn of SYNONYM_GROUPS[grpIdx]) expanded.add(syn);
+        }
+    }
+    return Array.from(expanded);
+}
+
+// ── Volatile fact patterns ────────────────────────────
+
+/** Patterns indicating a fact is likely to change over time and needs re-verification. */
+const VOLATILE_PATTERNS: Array<{ pattern: RegExp; hint: string }> = [
+    { pattern: /\bport\s+\d+/i, hint: 'Verify port in docker-compose.yml or config file' },
+    { pattern: /\bv?\d+\.\d+\.\d+/, hint: 'Verify version in package.json or lock file' },
+    { pattern: /\/[\w/.-]+\.\w{1,5}/, hint: 'Verify file path still exists on filesystem' },
+    { pattern: /localhost:\d+/i, hint: 'Verify local service is running' },
+    { pattern: /process\.env\./i, hint: 'Verify environment variable is set' },
+    { pattern: /\benv(?:ironment)?\s+var/i, hint: 'Verify environment variable value' },
+    { pattern: /\bapi[_ ]?key/i, hint: 'Verify API key is still valid' },
+    { pattern: /\bbranch\b/i, hint: 'Verify git branch with: git branch --show-current' },
+];
+
+function detectVolatility(factContent: string): { volatile: boolean; hint: string } {
+    for (const { pattern, hint } of VOLATILE_PATTERNS) {
+        if (pattern.test(factContent)) return { volatile: true, hint };
+    }
+    return { volatile: false, hint: '' };
 }
 
 // ── Contradiction detection patterns ─────────────────
@@ -241,7 +349,7 @@ function checkContradiction(existingFact: Fact, newFactStr: string): Contradicti
         if (keysA.size > 0 && keysB.size > 0) {
             let shared = 0, divergent = 0;
             for (const k of keysB) { if (keysA.has(k)) shared++; else divergent++; }
-            if (divergent > 0 && shared >= 0) {
+            if (divergent > 0 && shared > 0) {
                 return {
                     entity: '',
                     existingFact: existingFact.content,
@@ -263,14 +371,31 @@ export class MemoryStore {
     private filePath: string;
     private ownerName: string;
     readonly tasks = new TaskManager();
+    /** In-RAM working memory (session-scoped, not persisted). */
+    readonly workingMemory = new WorkingMemoryManager();
 
     /** Timestamp of last confidence refresh (throttle at 5 min). */
     private lastConfidenceRefresh = 0;
     private static readonly CONFIDENCE_REFRESH_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
 
+    /** Date string (YYYY-MM-DD) of last backup — one .bak per calendar day. */
+    private lastBackupDate = '';
+
+    // ── Exchange archive (append-only JSONL, never truncates older data) ──
+    /** Path to exchanges-archive.jsonl — append-only, never overwritten. */
+    private archivePath: string;
+    /** Exchanges waiting to be flushed to archive file (queued by addExchange). */
+    private pendingArchive: Exchange[] = [];
+    /** Last 500 exchanges from archive (loaded at init, kept current for searching). */
+    private archiveHot: Exchange[] = [];
+    /** Total number of exchanges ever written to archive. */
+    private archiveCount = 0;
+
     constructor(filePath: string, ownerName = 'Admin') {
         this.filePath = filePath;
         this.ownerName = ownerName;
+        // Derive archive path: .forkscout/memory.json → .forkscout/exchanges-archive.jsonl
+        this.archivePath = filePath.replace(/\.json$/, '') + '-exchanges-archive.jsonl';
     }
 
     async init(): Promise<void> {
@@ -340,9 +465,24 @@ export class MemoryStore {
                 this.exchanges = v7.exchanges || [];
                 this.tasks.load(v7.activeTasks || []);
             }
-        } catch { /* start fresh */ }
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                console.warn('⚠️ Memory load failed, starting fresh:', err);
+            }
+        }
+        // ── Load exchange archive ─────────────────────────────────────
+        // Only the last 500 are kept in archiveHot (for synchronous search).
+        // Full archive is append-only on disk — never read in full at runtime.
+        try {
+            const archiveData = await readFile(this.archivePath, 'utf-8');
+            const lines = archiveData.split('\n').filter(l => l.trim());
+            this.archiveCount = lines.length;
+            this.archiveHot = lines.slice(-500).map(l => JSON.parse(l) as Exchange);
+            console.log(`📚 Archive: ${this.archiveCount} historical exchanges (last ${this.archiveHot.length} searchable)`);
+        } catch { /* no archive file yet — starts empty on first run */ }
+
         this.ensureSelfEntity();
-        console.log(`🧠 Memory: ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} exchanges`);
+        console.log(`🧠 Memory: ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} hot + ${this.archiveCount} archived exchanges`);
     }
 
     async flush(): Promise<void> {
@@ -357,6 +497,31 @@ export class MemoryStore {
 
         try {
             await mkdir(dirname(this.filePath), { recursive: true });
+
+            // ── Flush exchange archive (append-only JSONL) ────────────────
+            // Exchanges that overflowed hot memory are appended here — never discarded.
+            if (this.pendingArchive.length > 0) {
+                const lines = this.pendingArchive.map(ex => JSON.stringify(ex)).join('\n') + '\n';
+                await appendFile(this.archivePath, lines, 'utf-8');
+                this.archiveCount += this.pendingArchive.length;
+                // Keep archiveHot current (last 500 from archive for searching)
+                this.archiveHot.push(...this.pendingArchive);
+                if (this.archiveHot.length > 500) this.archiveHot = this.archiveHot.slice(-500);
+                this.pendingArchive = [];
+            }
+
+            // ── Daily backup (keep yesterday's snapshot as .bak) ──────────
+            const today = new Date().toISOString().slice(0, 10);
+            if (this.lastBackupDate !== today) {
+                try {
+                    await access(this.filePath);
+                    await copyFile(this.filePath, this.filePath + '.bak');
+                    this.lastBackupDate = today;
+                    console.log(`💾 Daily backup → memory.json.bak`);
+                } catch { /* no existing file yet — skip backup */ }
+            }
+
+            // ── Atomic write: tmp → rename (crash-safe on POSIX) ─────────
             const data: MemoryData = {
                 version: 7,
                 entities: Array.from(this.entities.values()),
@@ -364,9 +529,11 @@ export class MemoryStore {
                 exchanges: this.exchanges.slice(-500),
                 activeTasks: this.tasks.snapshot(),
             };
-            this.tasks.clearDirty();
-            await writeFile(this.filePath, JSON.stringify(data, null, 2), 'utf-8');
+            const tmp = this.filePath + '.tmp';
+            await writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
+            await rename(tmp, this.filePath); // atomic on POSIX
             this.dirty = false;
+            this.tasks.clearDirty();
         } catch (err) { console.error('Memory flush failed:', err); }
     }
 
@@ -433,6 +600,8 @@ export class MemoryStore {
         };
         this.entities.set(k, entity);
         this.dirty = true;
+        // Auto-infer relations for newly created entities (best-effort, non-blocking)
+        this.inferRelations(entity);
         return { entity, contradictions };
     }
 
@@ -583,6 +752,12 @@ export class MemoryStore {
             ...(tags && Object.keys(tags).length > 0 ? { tags } : {}),
         };
         this.exchanges.push(ex);
+        // When hot window overflows, move oldest exchanges to pendingArchive
+        // (flushed to append-only JSONL on next flush — never discarded)
+        if (this.exchanges.length > 600) {
+            const overflow = this.exchanges.splice(0, this.exchanges.length - 500);
+            this.pendingArchive.push(...overflow);
+        }
         this.dirty = true;
         return ex;
     }
@@ -598,33 +773,46 @@ export class MemoryStore {
      */
     searchEntities(query: string, limit = 5, filter?: Record<string, string>): Entity[] {
         const q = query.toLowerCase();
-        const terms = q.split(/\s+/).filter(Boolean);
+        const rawTerms = q.split(/\s+/).filter(Boolean);
+        const terms = expandTerms(rawTerms); // semantic: stems + synonyms
         const scored: Array<{ entity: Entity; score: number }> = [];
+
+        // Pre-compute average active-fact char length for BM25 length normalisation
+        let totalChars = 0, totalFacts = 0;
+        for (const e of this.entities.values()) {
+            for (const f of e.facts) {
+                if (f.status === 'active') { totalChars += f.content.length; totalFacts++; }
+            }
+        }
+        const avgFactLen = totalFacts > 0 ? totalChars / totalFacts : 60;
+
         for (const entity of this.entities.values()) {
             // Tag-based pre-filter: skip entities that don't match the filter
             if (filter && !this.matchesFilter(entity.tags, filter)) continue;
 
             let score = 0;
             const nameL = entity.name.toLowerCase();
+
+            // Name matching (highest weight — exact > partial > term)
             if (nameL === q) score += 10;
             else if (nameL.includes(q)) score += 5;
-            for (const t of terms) {
-                if (nameL.includes(t)) score += 2;
-                for (const f of entity.facts) {
-                    // Only ACTIVE facts contribute to search relevance
-                    if (f.status === 'superseded') continue;
-                    if (f.content.toLowerCase().includes(t)) {
-                        // Weight by confidence — high-confidence facts matter more
-                        score += f.confidence;
-                    }
-                }
+            for (const t of terms) { if (nameL.includes(t)) score += 2; }
+
+            // BM25 scoring over all active fact text (much better than per-word counting)
+            const activeFacts = entity.facts.filter(f => f.status === 'active');
+            if (activeFacts.length > 0 && terms.length > 0) {
+                const factsText = activeFacts.map(f => f.content).join(' ');
+                const avgConf = activeFacts.reduce((s, f) => s + f.confidence, 0) / activeFacts.length;
+                // Confidence multiplier: high-confidence facts rank higher (0.5x–1.0x)
+                score += bm25Score(terms, factsText, avgFactLen) * (0.5 + avgConf * 0.5);
             }
-            // Recency bonus: recently seen entities rank higher
+
+            // Recency bonus (up to +0.5 for entities accessed today)
             const ageDays = (Date.now() - entity.lastSeen) / (1000 * 60 * 60 * 24);
-            const recencyBonus = Math.exp(-ageDays / 30) * 0.5; // up to +0.5
-            score += recencyBonus;
-            // Access bonus (capped)
+            score += Math.exp(-ageDays / 30) * 0.5;
+            // Access frequency bonus (capped at +1.0)
             score += Math.min(entity.accessCount * 0.1, 1);
+
             if (score > 0) scored.push({ entity, score });
         }
         const results = scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.entity);
@@ -641,9 +829,17 @@ export class MemoryStore {
     }
 
     searchExchanges(query: string, limit = 5, filter?: Record<string, string>): Exchange[] {
-        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const terms = expandTerms(query.toLowerCase().split(/\s+/).filter(Boolean)); // semantic expansion
+
+        // Search pool: hot exchanges + archiveHot (deduplicated by id)
+        // archiveHot holds the last 500 archived — so combined pool is up to 1000 entries
+        const seenIds = new Set<string>();
+        const pool: Exchange[] = [];
+        for (const ex of this.exchanges) { pool.push(ex); seenIds.add(ex.id); }
+        for (const ex of this.archiveHot) { if (!seenIds.has(ex.id)) pool.push(ex); }
+
         const scored: Array<{ ex: Exchange; score: number }> = [];
-        for (const ex of this.exchanges) {
+        for (const ex of pool) {
             // Tag-based pre-filter
             if (filter && !this.matchesFilter(ex.tags, filter)) continue;
 
@@ -807,7 +1003,12 @@ export class MemoryStore {
 
     get entityCount(): number { return this.entities.size; }
     get relationCount(): number { return this.relations.length; }
-    get exchangeCount(): number { return this.exchanges.length; }
+    /** Hot exchanges currently in memory (last 500). */
+    get hotExchangeCount(): number { return this.exchanges.length; }
+    /** Total exchanges ever recorded (hot + archived). */
+    get exchangeCount(): number { return this.exchanges.length + this.archiveCount; }
+    /** Exchanges stored in the append-only archive file. */
+    get archiveExchangeCount(): number { return this.archiveCount; }
 
     private key(name: string): string { return name.toLowerCase().trim(); }
 
@@ -946,7 +1147,8 @@ export class MemoryStore {
         report.relationsRemoved = beforeRels - this.relations.length;
 
         // 5. Detect near-duplicate entities (Jaccard similarity on normalized names)
-        const names = Array.from(this.entities.keys());
+        //    Cap at 300 names to avoid O(n²) blowup on large graphs
+        const names = Array.from(this.entities.keys()).slice(0, 300);
         for (let i = 0; i < names.length; i++) {
             for (let j = i + 1; j < names.length; j++) {
                 const sim = jaccardSimilarity(names[i], names[j]);
@@ -960,6 +1162,9 @@ export class MemoryStore {
                 }
             }
         }
+
+        // 6. Prune old terminal tasks (keep last 50 completed/aborted)
+        this.tasks.prune(50);
 
         if (report.factsPruned > 0 || report.entitiesRemoved > 0 || report.relationsRemoved > 0) {
             this.dirty = true;
@@ -1005,7 +1210,6 @@ export class MemoryStore {
      * Runs server-side for direct fs access (no HTTP round-trips).
      */
     async verifyFileEntities(maxFiles = 50): Promise<{ filesChecked: number; filesMissing: number; factsMarked: number }> {
-        const { access } = await import('fs/promises');
         const stats = { filesChecked: 0, filesMissing: 0, factsMarked: 0 };
 
         const fileEntities = Array.from(this.entities.values()).filter(e => e.type === 'file');
@@ -1038,5 +1242,124 @@ export class MemoryStore {
                 'Capable of running commands, editing files, web search, and scheduling tasks',
             ]);
         }
+    }
+
+    // ── Auto-relation inference ──────────────────────────────────────────────
+
+    /**
+     * Automatically infer relations for a newly created entity.
+     * Two strategies:
+     *   1. Co-occurrence: entities mentioned together in recent exchanges → 'related-to'
+     *   2. Dependency pattern: "uses X" / "depends on Y" in facts → 'depends-on'
+     *
+     * Non-blocking — errors are swallowed so they never break addEntity.
+     */
+    private inferRelations(entity: Entity): void {
+        try {
+            const entityNameL = entity.name.toLowerCase();
+            const recentExchanges = this.exchanges.slice(-50);
+
+            // Strategy 1: co-occurrence in recent exchanges
+            for (const [key, other] of this.entities) {
+                if (key === this.key(entity.name)) continue;
+                if (other.type === 'agent-self') continue;
+                if (other.name.length < 3) continue;
+
+                const otherNameL = other.name.toLowerCase();
+                let coCount = 0;
+                for (const ex of recentExchanges) {
+                    const text = `${ex.user} ${ex.assistant}`.toLowerCase();
+                    if (text.includes(entityNameL) && text.includes(otherNameL)) coCount++;
+                }
+                if (coCount >= 2) {
+                    const linked = this.relations.some(r =>
+                        (this.key(r.from) === this.key(entity.name) && this.key(r.to) === key) ||
+                        (this.key(r.to) === this.key(entity.name) && this.key(r.from) === key));
+                    if (!linked) this.addRelation(entity.name, 'related-to', other.name);
+                }
+            }
+
+            // Strategy 2: dependency pattern in fact text
+            const DEP = /\b(?:uses?|depends? on|requires?|built with|powered by)\s+([\w][\w\s.-]{1,25})/gi;
+            for (const fact of entity.facts) {
+                if (fact.status !== 'active') continue;
+                let m: RegExpExecArray | null;
+                while ((m = DEP.exec(fact.content)) !== null) {
+                    const depName = m[1].trim().toLowerCase();
+                    const target = Array.from(this.entities.values()).find(e =>
+                        e.name.toLowerCase().includes(depName) ||
+                        depName.includes(e.name.toLowerCase().slice(0, Math.max(4, e.name.length - 2))));
+                    if (target && this.key(target.name) !== this.key(entity.name)) {
+                        const exists = this.relations.some(r =>
+                            this.key(r.from) === this.key(entity.name) && this.key(r.to) === this.key(target.name));
+                        if (!exists) this.addRelation(entity.name, 'depends-on', target.name);
+                    }
+                }
+            }
+        } catch { /* non-blocking */ }
+    }
+
+    // ── Knowledge gaps ───────────────────────────────────────────────────────
+
+    /**
+     * Return a list of volatile facts (port numbers, versions, paths, env vars)
+     * that have not been confirmed recently (> 7 days).
+     * These represent the agent's "known unknowns" — things it believes but
+     * should verify before acting on.
+     */
+    getKnowledgeGaps(staleAfterDays = 7, maxResults = 25): KnowledgeGap[] {
+        const gaps: KnowledgeGap[] = [];
+        const staleCutoff = Date.now() - staleAfterDays * 24 * 60 * 60 * 1000;
+
+        for (const entity of this.entities.values()) {
+            for (const fact of entity.facts) {
+                if (fact.status !== 'active') continue;
+                if (fact.lastConfirmed > staleCutoff) continue; // recently confirmed — fresh
+                const { volatile, hint } = detectVolatility(fact.content);
+                if (volatile) {
+                    gaps.push({
+                        entityName: entity.name,
+                        factContent: fact.content,
+                        volatility: 'volatile',
+                        lastVerified: fact.lastConfirmed,
+                        verificationHint: hint,
+                    });
+                }
+            }
+        }
+
+        // Stalest first
+        return gaps.sort((a, b) => a.lastVerified - b.lastVerified).slice(0, maxResults);
+    }
+
+    // ── Outcome records ─────────────────────────────────────────────────────
+
+    /**
+     * Auto-create a failure post-mortem entity when a task is aborted.
+     * Stored as type:'failure' so it surfaces in future searches and
+     * helps the agent avoid repeating the same mistakes.
+     */
+    createFailurePostmortem(title: string, goal: string, reason: string, durationMs: number): Entity {
+        const { entity } = this.addEntity(`failure: ${title}`, 'failure', [
+            `Goal: ${goal}`,
+            `Failed because: ${reason}`,
+            `Duration before abort: ${Math.round(durationMs / 60000)}min`,
+            `[auto-postmortem] Saved when task was aborted — use this to avoid repeating the mistake`,
+        ]);
+        return entity;
+    }
+
+    /**
+     * Auto-create a success record entity when a task is completed.
+     * Stored as type:'success' so the agent can recall what approaches worked.
+     */
+    createSuccessRecord(title: string, goal: string, outcome: string, durationMs: number): Entity {
+        const { entity } = this.addEntity(`success: ${title}`, 'success', [
+            `Goal achieved: ${goal}`,
+            `Outcome: ${outcome}`,
+            `Duration: ${Math.round(durationMs / 60000)}min`,
+            `[auto-record] Saved when task was completed — use this to replicate success`,
+        ]);
+        return entity;
     }
 }

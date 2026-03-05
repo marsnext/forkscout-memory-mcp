@@ -25,9 +25,10 @@ export class TaskManager {
         importance?: number;
     }): ActiveTask {
         const similar = this.findSimilar(title, goal);
-        if (similar && similar.status === 'running') {
+        if (similar && (similar.status === 'running' || similar.status === 'paused')) {
+            // Resume/touch the existing task instead of creating a duplicate
+            similar.status = 'running';
             similar.lastStepAt = Date.now();
-            // Update priority/importance if provided
             if (opts?.priority !== undefined) similar.priority = opts.priority;
             if (opts?.importance !== undefined) similar.importance = opts.importance;
             this._dirty = true;
