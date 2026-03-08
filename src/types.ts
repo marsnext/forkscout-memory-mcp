@@ -77,6 +77,102 @@ export const RELATION_TYPES = [
     'forgets',
     'updates',
     'replaces',
+
+    // NEW — ontology / classification
+    'is-a',
+    'instance-of',
+    'subclass-of',
+    'type-of',
+    'has-name',
+    'alias',
+    'same-as',
+    'different-from',
+
+    // NEW — properties / attributes
+    'has-property',
+    'has-value',
+    'has-color',
+    'has-size',
+    'has-weight',
+    'has-height',
+    'has-age',
+    'has-length',
+    'has-width',
+    'has-shape',
+    'has-texture',
+    'has-temperature',
+    'has-speed',
+
+    // NEW — structural / spatial
+    'has-part',
+    'component-of',
+    'contains',
+    'inside',
+    'attached-to',
+    'located-in',
+    'lives-in',
+    'born-in',
+    'created-in',
+    'near',
+    'outside',
+    'adjacent-to',
+    'located-near',
+    'connected-to',
+
+    // NEW — ownership / authority
+    'owned-by',
+    'belongs-to',
+    'controlled-by',
+    'managed-by',
+    'produced-by',
+    'created-by',
+    'member-of',
+    'leader-of',
+
+    // NEW — actions / behavior
+    'performs',
+    'acts',
+    'eats',
+    'drinks',
+    'runs',
+    'writes',
+    'builds',
+    'destroys',
+    'interacts-with',
+    'communicates-with',
+    'affects',
+    'influences',
+    'prevents',
+    'enables',
+    'works-at',
+    'studies-at',
+    'participates-in',
+    'travels-to',
+
+    // NEW — temporal (coarse)
+    'before',
+    'after',
+    'during',
+    'started-at',
+    'ended-at',
+    'occurs-in',
+
+    // NEW — comparison / similarity
+    'similar-to',
+    'opposite-of',
+    'bigger-than',
+    'smaller-than',
+    'equal-to',
+    'greater-than',
+    'less-than',
+
+    // NEW — semantic / representational
+    'inspired-by',
+    'represents',
+    'symbolizes',
+    'measures',
+    'calculates',
+    'converts-to',
 ] as const;
 
 export type RelationType = typeof RELATION_TYPES[number];
@@ -165,6 +261,8 @@ export interface MemoryData {
     relations: Relation[];
     exchanges: Exchange[];
     activeTasks: ActiveTask[];
+    /** Persisted working-memory sessions (restored on server restart). */
+    workingMemorySessions?: Record<string, WorkingMemoryEvent[]>;
 }
 
 /** V6 shapes for migration (no tags field on entities/exchanges). */
@@ -228,5 +326,29 @@ export interface KnowledgeGap {
     lastVerified: number;
     /** Human hint on how to re-verify (e.g. "Check package.json for version"). */
     verificationHint: string;
+}
+
+// ── Frontend visualization snapshot ─────────────────────────────────────────
+
+export interface MemoryVisualizationStats {
+    entities: number;
+    relations: number;
+    exchanges: number;
+    exchangesHot: number;
+    exchangesArchived: number;
+    activeTasks: number;
+    staleEntities: number;
+    knowledgeGaps: number;
+}
+
+export interface MemoryVisualizationSnapshot {
+    generatedAt: number;
+    stats: MemoryVisualizationStats;
+    entities: Entity[];
+    relations: Relation[];
+    exchanges: Exchange[];
+    activeTasks: ActiveTask[];
+    knowledgeGaps: KnowledgeGap[];
+    staleEntities: Array<Pick<Entity, 'name' | 'type' | 'lastSeen' | 'accessCount' | 'tags'>>;
 }
 

@@ -12,6 +12,7 @@ services:
       - MEMORY_STORAGE=/data
       - MEMORY_OWNER=Suru
       - VERIFY_FILES=false
+      - TRANSFORMERS_CACHE=/data/.transformers-cache
     restart: unless-stopped
     networks:
       - default

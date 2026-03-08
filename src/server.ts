@@ -23,6 +23,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { MemoryStore } from './store.js';
 import { registerTools } from './tools.js';
+import { renderVisualizerHtml } from './visualizer.js';
 
 const PORT = parseInt(process.env.MEMORY_PORT || '3211', 10);
 const HOST = process.env.MEMORY_HOST || '0.0.0.0';
@@ -58,7 +59,7 @@ async function main() {
             console.log('[Consolidator] Starting full consolidation (pruning + verification)...');
 
             // 1. Consolidate (confidence refresh, pruning, orphan cleanup, duplicate detection)
-            const report = store.consolidate();
+            const report = await store.consolidate();
             const lines = [
                 `  Confidence refreshed: ${report.factsRefreshed}`,
                 `  Facts pruned: ${report.factsPruned}`,
@@ -127,6 +128,25 @@ async function main() {
             return;
         }
 
+        if (url === '/api/memory') {
+            try {
+                const snapshot = await store.getVisualizationSnapshot();
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify(snapshot));
+            } catch (err) {
+                console.error('Visualization API error:', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Failed to build memory snapshot.' }));
+            }
+            return;
+        }
+
+        if (url === '/visualizer') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(renderVisualizerHtml());
+            return;
+        }
+
         // MCP endpoint — stateless: fresh transport per request
         if (url.startsWith('/mcp')) {
             const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -154,7 +174,7 @@ async function main() {
         }
 
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Not found. Use /mcp or /health.' }));
+        res.end(JSON.stringify({ error: 'Not found. Use /mcp, /health, /api/memory, or /visualizer.' }));
     });
 
     server.listen(PORT, HOST, () => {

@@ -1,5 +1,5 @@
-# ── Single-stage Bun — runs TypeScript natively ──
-FROM oven/bun:1-alpine
+# ── Debian-based Bun (glibc required for onnxruntime-node native bindings) ──
+FROM oven/bun:1
 
 LABEL org.opencontainers.image.source="https://github.com/martianacademy/forkscout-memory-mcp"
 LABEL org.opencontainers.image.description="Persistent memory MCP server for AI agents - knowledge graph, vector search, structured facts"
@@ -17,6 +17,8 @@ ENV NODE_ENV=production
 ENV MEMORY_PORT=3211
 ENV MEMORY_HOST=0.0.0.0
 ENV MEMORY_STORAGE=/data
+# Model cache inside the data volume so it persists across container rebuilds
+ENV TRANSFORMERS_CACHE=/data/.transformers-cache
 
 EXPOSE 3211
 

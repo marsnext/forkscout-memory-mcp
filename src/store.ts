@@ -6,7 +6,8 @@
 import { readFile, writeFile, rename, copyFile, appendFile, mkdir, access } from 'fs/promises';
 import { dirname } from 'path';
 import { WorkingMemoryManager } from './working-memory.js';
-import type { Entity, EntityType, Exchange, Fact, KnowledgeGap, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5, LegacyMemoryDataV6 } from './types.js';
+import { EmbeddingManager, cosine } from './embeddings.js';
+import type { Entity, EntityType, Exchange, Fact, KnowledgeGap, MemoryData, Relation, RelationType, SearchResult, LegacyMemoryDataV4, LegacyMemoryDataV5, LegacyMemoryDataV6, MemoryVisualizationSnapshot } from './types.js';
 import { SELF_ENTITY_NAME } from './types.js';
 import { TaskManager } from './tasks.js';
 
@@ -17,6 +18,7 @@ export interface ConsolidationReport {
     factsPruned: number;
     entitiesRemoved: number;
     relationsRemoved: number;
+    exchangesPruned: number;
     duplicatesFound: Array<{ entityA: string; entityB: string; similarity: number }>;
 }
 
@@ -56,6 +58,26 @@ function computeConfidence(sources: number, lastConfirmedMs: number): number {
     const recencyBonus = Math.exp(-ageDays / 90) * 0.30; // 0..0.30
 
     return Math.round(Math.min(sourceBase + recencyBonus, 1) * 100) / 100;
+}
+
+/**
+ * Auto-score exchange importance from keyword signals.
+ * Returns 0.40–0.85 based on how many high-signal words appear.
+ * Used when the caller does not explicitly provide importance=.
+ */
+const IMPORTANCE_KEYWORDS = [
+    'fix', 'fixed', 'root cause', 'bug', 'error', 'critical', 'decided', 'decision',
+    'discovered', 'learned', 'issue', 'problem', 'solved', 'solution', 'broken',
+    'crash', 'never', 'always', 'must', 'important', 'architecture', 'design',
+];
+function autoImportance(user: string, assistant: string): number {
+    const text = (user + ' ' + assistant).toLowerCase();
+    let hits = 0;
+    for (const kw of IMPORTANCE_KEYWORDS) { if (text.includes(kw)) hits++; }
+    if (hits >= 4) return 0.85;
+    if (hits >= 2) return 0.70;
+    if (hits >= 1) return 0.55;
+    return 0.40;
 }
 
 /** Create a new Fact from a plain string. */
@@ -371,8 +393,10 @@ export class MemoryStore {
     private filePath: string;
     private ownerName: string;
     readonly tasks = new TaskManager();
-    /** In-RAM working memory (session-scoped, not persisted). */
+    /** In-RAM working memory (session-scoped, persisted on flush). */
     readonly workingMemory = new WorkingMemoryManager();
+    /** Local vector embeddings (384-dim MiniLM, persisted to disk). */
+    readonly embeddings = new EmbeddingManager();
 
     /** Timestamp of last confidence refresh (throttle at 5 min). */
     private lastConfidenceRefresh = 0;
@@ -396,6 +420,27 @@ export class MemoryStore {
         this.ownerName = ownerName;
         // Derive archive path: .forkscout/memory.json → .forkscout/exchanges-archive.jsonl
         this.archivePath = filePath.replace(/\.json$/, '') + '-exchanges-archive.jsonl';
+    }
+
+    /** Text representation of an entity used for embedding. */
+    private entityEmbedText(entity: Entity): string {
+        const facts = entity.facts
+            .filter(f => f.status === 'active')
+            .map(f => f.content)
+            .join('. ');
+        return facts ? `${entity.name}: ${facts}` : entity.name;
+    }
+
+    /** Embed an entity in the background (fire-and-forget). */
+    private embedEntityAsync(entity: Entity): void {
+        const key = this.key(entity.name);
+        const text = this.entityEmbedText(entity);
+        this.embeddings.encode(text).then(vec => {
+            if (vec) {
+                this.embeddings.set(key, vec);
+                // No need to set dirty here — embeddings.dirty handles persistence
+            }
+        }).catch(() => { /* model unavailable — silently skip */ });
     }
 
     async init(): Promise<void> {
@@ -464,6 +509,10 @@ export class MemoryStore {
                 this.relations = v7.relations || [];
                 this.exchanges = v7.exchanges || [];
                 this.tasks.load(v7.activeTasks || []);
+                // Restore working memory sessions (persisted across restarts)
+                if (v7.workingMemorySessions) {
+                    this.workingMemory.restoreSessions(v7.workingMemorySessions);
+                }
             }
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -481,11 +530,24 @@ export class MemoryStore {
             console.log(`📚 Archive: ${this.archiveCount} historical exchanges (last ${this.archiveHot.length} searchable)`);
         } catch { /* no archive file yet — starts empty on first run */ }
 
+        // ── Load embeddings from disk then warm up model ──────────────
+        const embeddingPath = this.filePath.replace(/\.json$/, '') + '-embeddings.json';
+        await this.embeddings.init(embeddingPath);
+
+        // Backfill embeddings for entities that don't have one yet (bg)
+        for (const entity of this.entities.values()) {
+            const k = this.key(entity.name);
+            if (!this.embeddings.has(k)) this.embedEntityAsync(entity);
+        }
+
         this.ensureSelfEntity();
         console.log(`🧠 Memory: ${this.entities.size} entities, ${this.relations.length} relations, ${this.exchanges.length} hot + ${this.archiveCount} archived exchanges`);
     }
 
     async flush(): Promise<void> {
+        // Embeddings persist independently of store dirty flag (backfill + new entities)
+        await this.embeddings.persist();
+
         if (!this.dirty && !this.tasks.isDirty()) return;
 
         // Auto-refresh confidence scores on every flush (throttled to once per 5 min)
@@ -528,6 +590,7 @@ export class MemoryStore {
                 relations: this.relations,
                 exchanges: this.exchanges.slice(-500),
                 activeTasks: this.tasks.snapshot(),
+                workingMemorySessions: this.workingMemory.serializeSessions(),
             };
             const tmp = this.filePath + '.tmp';
             await writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
@@ -602,6 +665,8 @@ export class MemoryStore {
         this.dirty = true;
         // Auto-infer relations for newly created entities (best-effort, non-blocking)
         this.inferRelations(entity);
+        // Update embedding in background (fire-and-forget)
+        this.embedEntityAsync(entity);
         return { entity, contradictions };
     }
 
@@ -612,6 +677,7 @@ export class MemoryStore {
         if (deleted) {
             this.relations = this.relations.filter(r =>
                 this.key(r.from) !== this.key(name) && this.key(r.to) !== this.key(name));
+            this.embeddings.delete(this.key(name));
             this.dirty = true;
         }
         return deleted;
@@ -739,16 +805,35 @@ export class MemoryStore {
 
     getAllRelations(): Relation[] { return this.relations; }
 
+    removeRelation(from: string, relType: string, to: string): boolean {
+        const before = this.relations.length;
+        this.relations = this.relations.filter(r =>
+            !(this.key(r.from) === this.key(from) && r.type === relType && this.key(r.to) === this.key(to)));
+        const removed = this.relations.length < before;
+        if (removed) this.dirty = true;
+        return removed;
+    }
+
     // ── Exchanges ────────────────────────────────────
 
-    addExchange(user: string, assistant: string, sessionId: string, importance?: number, tags?: Record<string, string>): Exchange {
+    addExchange(user: string, assistant: string, sessionId: string, importance?: number, tags?: Record<string, string>): Exchange | null {
+        // Duplicate guard: reject if same user text was saved within the last 5 minutes
+        const userNorm = user.slice(0, 120).toLowerCase().replace(/\s+/g, ' ').trim();
+        const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+        const isDuplicate = this.exchanges.slice(-30).some(ex => {
+            if (ex.timestamp < fiveMinAgo) return false;
+            return ex.user.slice(0, 120).toLowerCase().replace(/\s+/g, ' ').trim() === userNorm;
+        });
+        if (isDuplicate) return null;
+
+        const resolvedImportance = importance ?? autoImportance(user, assistant);
         const ex: Exchange = {
             id: `ex_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             user: user.slice(0, 2000),
             assistant: assistant.slice(0, 2000),
             timestamp: Date.now(),
             sessionId,
-            importance,
+            importance: resolvedImportance,
             ...(tags && Object.keys(tags).length > 0 ? { tags } : {}),
         };
         this.exchanges.push(ex);
@@ -763,6 +848,56 @@ export class MemoryStore {
     }
 
     getExchanges(): Exchange[] { return this.exchanges; }
+
+    /**
+     * Remove exchange(s) from hot memory and rewrite the archive JSONL.
+     * Matches by exact id OR keyword substring (if keyword.length > 5).
+     */
+    async removeExchange(idOrKeyword: string): Promise<{ hotRemoved: number; archiveRemoved: number }> {
+        const lower = idOrKeyword.toLowerCase();
+        const matchFn = (ex: Exchange): boolean => {
+            if (ex.id === idOrKeyword) return true;
+            if (lower.length > 5 && `${ex.user} ${ex.assistant}`.toLowerCase().includes(lower)) return true;
+            return false;
+        };
+        const hotBefore = this.exchanges.length;
+        this.exchanges = this.exchanges.filter(ex => !matchFn(ex));
+        const hotRemoved = hotBefore - this.exchanges.length;
+        const archiveRemoved = await this.rewriteArchive(ex => !matchFn(ex));
+        if (hotRemoved + archiveRemoved > 0) this.dirty = true;
+        return { hotRemoved, archiveRemoved };
+    }
+
+    /**
+     * Rewrite the entire exchange archive JSONL keeping only entries that pass filter.
+     * Updates archiveCount and archiveHot in memory.
+     * Returns the number of entries pruned.
+     */
+    private async rewriteArchive(filter: (ex: Exchange) => boolean): Promise<number> {
+        try {
+            const raw = await readFile(this.archivePath, 'utf-8').catch(() => '');
+            const lines = raw.split('\n').filter(l => l.trim());
+            const kept: Exchange[] = [];
+            let pruned = 0;
+            for (const line of lines) {
+                try {
+                    const ex = JSON.parse(line) as Exchange;
+                    if (filter(ex)) { kept.push(ex); } else { pruned++; }
+                } catch { /* skip malformed */ }
+            }
+            if (pruned > 0) {
+                await writeFile(this.archivePath,
+                    kept.map(ex => JSON.stringify(ex)).join('\n') + (kept.length > 0 ? '\n' : ''),
+                    'utf-8');
+                this.archiveCount = kept.length;
+                this.archiveHot = kept.slice(-500);
+            }
+            return pruned;
+        } catch (err) {
+            console.error('Archive rewrite failed:', err);
+            return 0;
+        }
+    }
 
     // ── Search ───────────────────────────────────────
 
@@ -856,10 +991,67 @@ export class MemoryStore {
         return scored.sort((a, b) => b.score - a.score).slice(0, limit).map(s => s.ex);
     }
 
-    searchKnowledge(query: string, limit = 5, filter?: Record<string, string>): SearchResult[] {
+    /**
+     * List exchanges with pagination and optional keyword filter.
+     * Returns total count (hot + all archived), pool size (searchable window),
+     * and the paginated slice sorted by relevance (if query) or recency (if no query).
+     */
+    listExchanges(
+        offset = 0,
+        limit = 20,
+        query?: string,
+        filter?: Record<string, string>,
+    ): { total: number; poolSize: number; items: Exchange[] } {
+        // Build deduplicated pool (hot + archiveHot, newest-first)
+        const seenIds = new Set<string>();
+        const pool: Exchange[] = [];
+        for (const ex of this.exchanges) { pool.push(ex); seenIds.add(ex.id); }
+        for (const ex of this.archiveHot) { if (!seenIds.has(ex.id)) pool.push(ex); }
+
+        // Apply optional tag filter
+        const base = filter
+            ? pool.filter(ex => this.matchesFilter(ex.tags, filter))
+            : pool;
+
+        let sorted: Exchange[];
+        if (query && query.trim()) {
+            const terms = expandTerms(query.toLowerCase().split(/\s+/).filter(Boolean));
+            const scored = base.map(ex => {
+                let score = 0;
+                const text = `${ex.user} ${ex.assistant}`.toLowerCase();
+                for (const t of terms) { if (text.includes(t)) score += 1; }
+                if (ex.importance) score += ex.importance * 2;
+                const ageDays = (Date.now() - ex.timestamp) / (1000 * 60 * 60 * 24);
+                score += Math.exp(-ageDays / 14) * 0.5;
+                return { ex, score };
+            }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+            sorted = scored.map(s => s.ex);
+        } else {
+            // No query — sort by recency (newest first)
+            sorted = [...base].sort((a, b) => b.timestamp - a.timestamp);
+        }
+
+        return {
+            total: this.exchangeCount,
+            poolSize: base.length,
+            items: sorted.slice(offset, offset + limit),
+        };
+    }
+
+    async searchKnowledge(query: string, limit = 5, filter?: Record<string, string>): Promise<SearchResult[]> {
         const results: SearchResult[] = [];
-        for (const e of this.searchEntities(query, limit, filter)) {
-            // Show top ACTIVE facts by confidence
+
+        // ── Semantic boosting: query embedding + cosine re-ranking ───────────
+        // If the model is ready, compute query embedding and blend with BM25 scores.
+        // If not ready (downloading / offline), falls back to BM25 only.
+        let queryVec: Float32Array | null = null;
+        if (this.embeddings.ready) {
+            queryVec = await this.embeddings.encode(query);
+        }
+
+        const bm25Entities = this.searchEntities(query, limit * 3, filter);
+
+        for (const e of bm25Entities) {
             const topFacts = [...e.facts]
                 .filter(f => f.status === 'active')
                 .sort((a, b) => b.confidence - a.confidence)
@@ -869,12 +1061,26 @@ export class MemoryStore {
             const avgConf = activeFacts.length > 0
                 ? Math.round(activeFacts.reduce((s, f) => s + f.confidence, 0) / activeFacts.length * 100)
                 : 0;
+
+            let relevance = avgConf;
+            if (queryVec) {
+                const entityVec = this.embeddings.get(this.key(e.name));
+                if (entityVec) {
+                    const sim = cosine(queryVec, entityVec);      // −1..1
+                    const simPct = Math.round((sim + 1) / 2 * 100); // 0..100
+                    // Blend: 60% BM25 confidence + 40% semantic similarity
+                    relevance = Math.round(avgConf * 0.6 + simPct * 0.4);
+                }
+            }
+
             results.push({
                 content: `${e.name} (${e.type}, ${avgConf}% conf): ${topFacts.join('; ')}`,
                 source: 'graph',
-                relevance: avgConf,
+                relevance,
             });
         }
+
+        // ── Exchange search (unchanged — BM25 only) ──────────────────────────
         for (const ex of this.searchExchanges(query, limit, filter)) {
             const imp = ex.importance ? Math.round(ex.importance * 100) : 70;
             results.push({
@@ -883,6 +1089,7 @@ export class MemoryStore {
                 relevance: imp,
             });
         }
+
         return results.sort((a, b) => b.relevance - a.relevance).slice(0, limit);
     }
 
@@ -1010,6 +1217,56 @@ export class MemoryStore {
     /** Exchanges stored in the append-only archive file. */
     get archiveExchangeCount(): number { return this.archiveCount; }
 
+    async getVisualizationSnapshot(): Promise<MemoryVisualizationSnapshot> {
+        const archivedExchanges: Exchange[] = [];
+        try {
+            const archiveData = await readFile(this.archivePath, 'utf-8');
+            const lines = archiveData.split('\n').filter(l => l.trim());
+            for (const line of lines) archivedExchanges.push(JSON.parse(line) as Exchange);
+        } catch { /* no archive yet */ }
+
+        const allExchanges = new Map<string, Exchange>();
+        for (const ex of archivedExchanges) allExchanges.set(ex.id, ex);
+        for (const ex of this.pendingArchive) allExchanges.set(ex.id, ex);
+        for (const ex of this.exchanges) allExchanges.set(ex.id, ex);
+
+        const staleEntities = this.getStaleEntities({ maxAgeDays: 30, limit: 200 }).map(entity => ({
+            name: entity.name,
+            type: entity.type,
+            lastSeen: entity.lastSeen,
+            accessCount: entity.accessCount,
+            tags: entity.tags,
+        }));
+        const knowledgeGaps = this.getKnowledgeGaps(7, 200);
+
+        return {
+            generatedAt: Date.now(),
+            stats: {
+                entities: this.entityCount,
+                relations: this.relationCount,
+                exchanges: allExchanges.size,
+                exchangesHot: this.hotExchangeCount,
+                exchangesArchived: this.archiveExchangeCount,
+                activeTasks: this.tasks.runningCount,
+                staleEntities: staleEntities.length,
+                knowledgeGaps: knowledgeGaps.length,
+            },
+            entities: Array.from(this.entities.values())
+                .slice()
+                .sort((a, b) => a.name.localeCompare(b.name)),
+            relations: this.relations
+                .slice()
+                .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to)),
+            exchanges: Array.from(allExchanges.values())
+                .sort((a, b) => b.timestamp - a.timestamp),
+            activeTasks: this.tasks.snapshot()
+                .slice()
+                .sort((a, b) => b.lastStepAt - a.lastStepAt),
+            knowledgeGaps,
+            staleEntities,
+        };
+    }
+
     private key(name: string): string { return name.toLowerCase().trim(); }
 
     /**
@@ -1057,7 +1314,7 @@ export class MemoryStore {
      * remove orphan relations, and detect near-duplicate entities.
      * Returns a report of changes made.
      */
-    consolidate(opts: {
+    async consolidate(opts: {
         /** Minimum confidence to keep a fact (default: 0.15) */
         minConfidence?: number;
         /** Max age in days for low-confidence facts before pruning (default: 60) */
@@ -1066,7 +1323,11 @@ export class MemoryStore {
         staleConfidenceThreshold?: number;
         /** Max age in days for superseded facts before archiving (default: 180) */
         archiveDays?: number;
-    } = {}): ConsolidationReport {
+        /** Max age in days for low-importance exchanges (default: undefined = no pruning) */
+        maxExchangeAgeDays?: number;
+        /** Min importance to keep an exchange older than maxExchangeAgeDays (default: 0.6) */
+        minExchangeImportance?: number;
+    } = {}): Promise<ConsolidationReport> {
         const minConf = opts.minConfidence ?? 0.15;
         const maxStaleDays = opts.maxStaleDays ?? 60;
         const staleConfThreshold = opts.staleConfidenceThreshold ?? 0.3;
@@ -1075,7 +1336,7 @@ export class MemoryStore {
 
         const report: ConsolidationReport = {
             factsRefreshed: 0, factsPruned: 0, entitiesRemoved: 0,
-            relationsRemoved: 0, duplicatesFound: [],
+            relationsRemoved: 0, exchangesPruned: 0, duplicatesFound: [],
         };
 
         // 1. Refresh all confidence scores (active facts only)
@@ -1166,7 +1427,22 @@ export class MemoryStore {
         // 6. Prune old terminal tasks (keep last 50 completed/aborted)
         this.tasks.prune(50);
 
-        if (report.factsPruned > 0 || report.entitiesRemoved > 0 || report.relationsRemoved > 0) {
+        // 7. Prune old low-importance exchanges (if requested)
+        if (opts.maxExchangeAgeDays !== undefined) {
+            const cutoff = now - opts.maxExchangeAgeDays * 24 * 60 * 60 * 1000;
+            const minImp = opts.minExchangeImportance ?? 0.6;
+            const keepExchange = (ex: Exchange): boolean => {
+                if (ex.timestamp > cutoff) return true;
+                return (ex.importance ?? 0) >= minImp;
+            };
+            const hotBefore = this.exchanges.length;
+            this.exchanges = this.exchanges.filter(keepExchange);
+            const hotPruned = hotBefore - this.exchanges.length;
+            const archivePruned = await this.rewriteArchive(keepExchange);
+            report.exchangesPruned = hotPruned + archivePruned;
+        }
+
+        if (report.factsPruned > 0 || report.entitiesRemoved > 0 || report.relationsRemoved > 0 || report.exchangesPruned > 0) {
             this.dirty = true;
         }
 

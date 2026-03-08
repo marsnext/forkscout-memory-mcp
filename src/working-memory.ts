@@ -54,4 +54,22 @@ export class WorkingMemoryManager {
     activeSessions(): number {
         return this.sessions.size;
     }
+
+    /** Serialize all sessions for persistence (flush to disk). */
+    serializeSessions(): Record<string, WorkingMemoryEvent[]> {
+        const result: Record<string, WorkingMemoryEvent[]> = {};
+        for (const [sessionId, events] of this.sessions) {
+            if (events.length > 0) result[sessionId] = events;
+        }
+        return result;
+    }
+
+    /** Restore sessions from persisted data (loaded on server restart). */
+    restoreSessions(data: Record<string, WorkingMemoryEvent[]>): void {
+        for (const [sessionId, events] of Object.entries(data)) {
+            if (Array.isArray(events) && events.length > 0) {
+                this.sessions.set(sessionId, events.slice(-WorkingMemoryManager.WINDOW));
+            }
+        }
+    }
 }
